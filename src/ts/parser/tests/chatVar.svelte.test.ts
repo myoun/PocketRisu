@@ -131,3 +131,10 @@ test('returns "null" for undefined variables', () => {
     })
   )
 })
+
+test('does not initialize scriptstate when reading an undefined variable', () => {
+  DBState.db.characters[0].chats[0].scriptstate = undefined
+
+  expect(getChatVar('missing')).toBe('null')
+  expect(DBState.db.characters[0].chats[0].scriptstate).toBeUndefined()
+})

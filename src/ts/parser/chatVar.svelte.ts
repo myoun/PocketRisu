@@ -9,8 +9,7 @@ export function getChatVar(key:string): string {
         return 'null'
     }
     const chat = char.chats[char.chatPage]
-    chat.scriptstate ??= {}
-    const state = (chat.scriptstate['$' + key])
+    const state = chat.scriptstate?.['$' + key]
     if(state === undefined || state === null){
         const defaultVariables = parseKeyValue(char.defaultVariables).concat(parseKeyValue(DBState.db.templateDefaultVariables))
         const findResult = defaultVariables.find((f) => {
