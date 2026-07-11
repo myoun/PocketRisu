@@ -346,7 +346,7 @@ describe('getOfficialRegistry', () => {
         )
     })
 
-    it('returns the remote entry (scoped) when present', () => {
+    it('merges the remote entry over bundled profiles when present', () => {
         mockDb.db.modelProfileRegistryCache = {
             schemaVersion: 4,
             registries: {
@@ -357,5 +357,26 @@ describe('getOfficialRegistry', () => {
         const reg = getOfficialRegistry()
         expect(Object.keys(reg.registries)).toEqual([getBundledRegistryId()])
         expect(reg.registries[getBundledRegistryId()]?.profiles?.['openai:gpt']).toBeTruthy()
+        // Built-in Codex stays available even when the public catalog does not
+        // yet have a Codex profile.
+        expect(reg.registries[getBundledRegistryId()]?.profiles?.['codex:gpt-5.5']).toBeTruthy()
+        expect(reg.registries[getBundledRegistryId()]?.baseProviders?.codex).toBeTruthy()
+    })
+
+    it('lets a remote entry override the bundled profile with the same id', () => {
+        mockDb.db.modelProfileRegistryCache = {
+            schemaVersion: 4,
+            registries: {
+                [getBundledRegistryId()]: {
+                    fetchedAt: 1,
+                    profiles: {
+                        'codex:gpt-5.5': { id: 'codex:gpt-5.5', providerBaseId: 'codex', displayName: 'Remote Codex' },
+                    },
+                    baseProviders: { codex: { id: 'codex', adapterKind: 'codex-responses' } },
+                },
+            },
+        }
+        const profile = getOfficialRegistry().registries[getBundledRegistryId()]?.profiles?.['codex:gpt-5.5']
+        expect(profile?.displayName).toBe('Remote Codex')
     })
 })

@@ -4,6 +4,7 @@ export type AdapterKind =
     | 'openai-compatible'
     | 'anthropic-messages'
     | 'google-gemini'
+    | 'codex-responses'
 
 // Adapter kinds whose tool (function-calling) wire is actually implemented.
 // Both the runtime gate (requestModelPreset) and the editor toggle UI check
@@ -13,6 +14,7 @@ export const TOOL_CAPABLE_ADAPTER_KINDS: readonly AdapterKind[] = [
     'openai-compatible',
     'anthropic-messages',
     'google-gemini',
+    'codex-responses',
 ]
 
 // Adapter kinds whose image-input (vision) wire is implemented. Vision is not

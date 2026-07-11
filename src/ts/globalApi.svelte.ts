@@ -1960,6 +1960,7 @@ export interface FetchNativeArgs {
     interceptor?: string
     requestTimeoutMs?: number
     networkRoute?: 'auto' | 'local_network'
+    forceProxy?: boolean
     /** Request-log classification; see GlobalFetchArgs for the same fields. */
     logCategory?: RequestLogCategory
     logSource?: RequestLogSource
@@ -2061,7 +2062,7 @@ async function fetchNativeRaw(url: string, arg: FetchNativeArgs, hooks?: {
     const requestSignal = timeoutSignal.signal
     const db = getDatabase()
     let throughProxy = !db.usePlainFetch
-    if (useLocalNetworkRoute) {
+    if (useLocalNetworkRoute || arg.forceProxy) {
         throughProxy = true
     }
 
@@ -2098,6 +2099,14 @@ async function fetchNativeRaw(url: string, arg: FetchNativeArgs, hooks?: {
 
         // Local network non-streaming or WS fallback: go through /proxy2 directly
         if (useLocalNetworkRoute) {
+            hooks?.onRoute?.('proxy')
+            return await fetchViaProxy2(url, headers, realBody, {
+                ...arg,
+                signal: requestSignal
+            })
+        }
+
+        if (arg.forceProxy) {
             hooks?.onRoute?.('proxy')
             return await fetchViaProxy2(url, headers, realBody, {
                 ...arg,

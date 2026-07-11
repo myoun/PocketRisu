@@ -26,7 +26,7 @@ export const CUSTOM_REGISTRY_ID = 'custom'
 export const CUSTOM_ID_PREFIX = 'custom::'
 export const FRAGMENT_SCHEMA_VERSION = 1
 
-const ADAPTER_KINDS: AdapterKind[] = ['openai-compatible', 'anthropic-messages', 'google-gemini']
+const ADAPTER_KINDS: AdapterKind[] = ['openai-compatible', 'anthropic-messages', 'google-gemini', 'codex-responses']
 
 /** Self-contained import/export unit: one profile plus its base provider. */
 export interface ProfileFragment {

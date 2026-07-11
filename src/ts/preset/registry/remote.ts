@@ -242,14 +242,33 @@ export async function syncRemoteRegistry(force = false): Promise<SyncResult> {
     }
 }
 
-// The official registry to read from: remote cache if present, else bundled.
-// Scoped to just the official entry so custom profiles never leak in.
+// The official registry is the bundled catalog overlaid by the remote cache.
+//
+// Adapters shipped in this app can depend on profiles the external catalog does
+// not know about yet (for example, Codex needs the built-in codex-responses
+// wire adapter). Keep those bundled profiles available while still letting a
+// published catalog replace any matching id. This also makes the app usable
+// when the user cannot edit the public registry repository.
+// Scoped to just the official entry so user-imported custom profiles never
+// leak into the official browser.
 export function getOfficialRegistry(): RegistryCache {
+    const bundled = loadBundledRegistry()
+    const bundledEntry = bundled.registries[getBundledRegistryId()]
     const remote = DBState.db.modelProfileRegistryCache?.registries?.[getBundledRegistryId()]
     if (remote?.profiles && Object.keys(remote.profiles).length > 0) {
-        return { schemaVersion: 4, registries: { [getBundledRegistryId()]: remote } }
+        return {
+            schemaVersion: 4,
+            registries: {
+                [getBundledRegistryId()]: {
+                    ...bundledEntry,
+                    ...remote,
+                    baseProviders: { ...bundledEntry?.baseProviders, ...remote.baseProviders },
+                    profiles: { ...bundledEntry?.profiles, ...remote.profiles },
+                },
+            },
+        }
     }
-    return loadBundledRegistry()
+    return bundled
 }
 
 // Per-preset update status against its source registry (official=remote-or-bundled,

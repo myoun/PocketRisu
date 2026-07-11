@@ -1,0 +1,19 @@
+{
+  "id": "codex:gpt-5.6-tera",
+  "version": 1,
+  "displayName": "GPT-5.6 Tera",
+  "providerBaseId": "codex",
+  "description": "GPT-5.6 Tera through ChatGPT Codex. Copy the access token and ChatGPT Account ID from Codex Manager into this preset.",
+  "descriptionI18n": { "ko": "ChatGPT Codex의 GPT-5.6 Tera입니다. Codex Manager에서 access token과 ChatGPT Account ID를 복사해 이 프리셋에 입력하세요." },
+  "tags": ["openai", "chatgpt", "codex", "oauth"],
+  "sortOrder": 901,
+  "modelId": "gpt-5.6-tera",
+  "endpoint": { "kind": "static", "url": "https://chatgpt.com/backend-api/codex/responses" },
+  "auth": { "kind": "bearer", "fields": ["apiKey"] },
+  "defaults": {},
+  "schema": [],
+  "uiSchema": { "groups": [], "fields": [] },
+  "capabilities": ["streaming", "tools", "reasoning"],
+  "sourceUrls": ["https://chatgpt.com/backend-api/codex/responses"],
+  "profileStatus": "current"
+}

@@ -25,6 +25,7 @@ import {
     sendChatRequest, streamChatRequest, previewChatRequest,
     sendAnthropicChatRequest, streamAnthropicChatRequest, previewAnthropicChatRequest,
     sendGoogleChatRequest, streamGoogleChatRequest, previewGoogleChatRequest,
+    sendCodexResponsesRequest, streamCodexResponsesRequest, previewCodexResponsesRequest,
     runToolLoop,
     type AdapterCacheContext,
     type AdapterChatMessage, type AdapterChatOptions, type AdapterChatResponse,
@@ -518,6 +519,7 @@ function sendModelPreset(
         case 'openai-compatible': return sendChatRequest(preset, options, credential)
         case 'anthropic-messages': return sendAnthropicChatRequest(preset, options, credential)
         case 'google-gemini': return sendGoogleChatRequest(preset, options, credential)
+        case 'codex-responses': return sendCodexResponsesRequest(preset, options, credential)
     }
 }
 
@@ -531,6 +533,7 @@ function streamModelPreset(
         case 'openai-compatible': return streamChatRequest(preset, options, credential)
         case 'anthropic-messages': return streamAnthropicChatRequest(preset, options, credential)
         case 'google-gemini': return streamGoogleChatRequest(preset, options, credential)
+        case 'codex-responses': return streamCodexResponsesRequest(preset, options, credential)
     }
 }
 
@@ -544,6 +547,7 @@ function previewModelPreset(
         case 'openai-compatible': return previewChatRequest(preset, options, credential)
         case 'anthropic-messages': return previewAnthropicChatRequest(preset, options, credential)
         case 'google-gemini': return previewGoogleChatRequest(preset, options, credential)
+        case 'codex-responses': return previewCodexResponsesRequest(preset, options, credential)
     }
 }
 
@@ -555,7 +559,11 @@ function previewModelPreset(
 // chatId (= the message generationId) is threaded into fetchNative so the
 // request is recorded in the fetch log against the message — otherwise the
 // per-message "view log" shows "deleted log" for binding requests.
-function makeProxiedFetch(chatId?: string, onRoute?: (route: RequestLogRoute) => void): typeof fetch {
+function makeProxiedFetch(
+    chatId?: string,
+    onRoute?: (route: RequestLogRoute) => void,
+    forceProxy: boolean = false,
+): typeof fetch {
     return ((input: RequestInfo | URL, init?: RequestInit) => {
         const url = typeof input === 'string' ? input : input.toString()
         return fetchNative(url, {
@@ -568,6 +576,7 @@ function makeProxiedFetch(chatId?: string, onRoute?: (route: RequestLogRoute) =>
             body: init?.body as string,
             signal: init?.signal ?? undefined,
             chatId,
+            forceProxy,
             // Local providers (e.g. self-hosted Ollama) must route through the node
             // proxy rather than a browser-direct fetch to a private address.
             networkRoute: isLocalNetworkUrl(url) ? 'local_network' : 'auto',
@@ -731,7 +740,11 @@ async function requestModelPreset(arg:RequestDataArgumentExtended, preset:ModelP
         provider: preset.profileSnapshot.providerBaseId,
         streaming: resolvePresetStreaming(preset, arg),
     })
-    const proxiedFetch = makeProxiedFetch(arg.chatId, (route) => logScope.setRoute(route))
+    const proxiedFetch = makeProxiedFetch(
+        arg.chatId,
+        (route) => logScope.setRoute(route),
+        kind === 'codex-responses',
+    )
 
     // Tool gating. Three guards:
     //  1) Per-preset opt-in (preset.toolUse, default OFF) — the hard regression
