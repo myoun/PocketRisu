@@ -5,7 +5,7 @@ import { DEFAULT_CHAT_LOAD_ADDITIONAL_PAGES, DEFAULT_CHAT_LOAD_INITIAL_PAGES, no
 import type { RisuPlugin } from '../plugins/plugins.svelte';
 import type {triggerscript as triggerscriptMain} from '../process/triggers';
 import { downloadFile, saveAsset as saveImageGlobal } from '../globalApi.svelte';
-import { defaultAutoSuggestPrompt, defaultJailbreak, defaultMainPrompt } from './defaultPrompts';
+import { defaultAutoSuggestPrompt, legacyDefaultAutoSuggestPrompt, defaultJailbreak, defaultMainPrompt } from './defaultPrompts';
 import { notifySuccess } from '../alert';
 import type { NAISettings } from '../process/models/nai';
 import { prebuiltNAIpresets, prebuiltPresets } from '../process/templates/templates';
@@ -410,6 +410,19 @@ export function setDatabase(data:Database){
     data.sendKeyPC ??= 'enter'
     data.sendKeyMobile ??= 'ctrl-enter'
     data.autoSuggestPrompt ??= defaultAutoSuggestPrompt
+    if(data.autoSuggestPrompt.replace(/\r\n/g, '\n').trim() === legacyDefaultAutoSuggestPrompt.trim()){
+        data.autoSuggestPrompt = defaultAutoSuggestPrompt
+    }
+    data.useGlobalAutoSuggestPrompt ??= false
+    data.globalAutoSuggestPrompt ??= defaultAutoSuggestPrompt
+    if(data.globalAutoSuggestPrompt.replace(/\r\n/g, '\n').trim() === legacyDefaultAutoSuggestPrompt.trim()){
+        data.globalAutoSuggestPrompt = defaultAutoSuggestPrompt
+    }
+    data.autoSuggestMessageCount ??= 10
+    data.autoSuggestCount ??= 5
+    data.autoSuggestLanguage ??= 'risu'
+    data.autoSuggestCustomLanguage ??= ''
+    data.autoSuggestToTranslatedInput ??= false
     data.autoSuggestPrefix ??= ""
     data.OAIPrediction ??= ''
     data.autoSuggestClean ??= true
@@ -1153,6 +1166,13 @@ export interface Database{
     koboldURL:string
     useAutoSuggestions:boolean
     autoSuggestPrompt:string
+    useGlobalAutoSuggestPrompt:boolean
+    globalAutoSuggestPrompt:string
+    autoSuggestMessageCount:number
+    autoSuggestCount:number
+    autoSuggestLanguage:string
+    autoSuggestCustomLanguage:string
+    autoSuggestToTranslatedInput:boolean
     autoSuggestPrefix:string
     autoSuggestClean:boolean
     claudeAPIKey:string,
@@ -2121,6 +2141,8 @@ export interface Chat{
     localLore: loreBook[]
     sdData?:string
     suggestMessages?:string[]
+    suggestMessagesCacheKey?:string
+    suggestMessagesCacheStatus?:'success'|'format'
     isStreaming?:boolean
     activeStreamingDisplayOptimizationMode?:StreamingDisplayOptimizationMode
     scriptstate?:{[key:string]:string|number|boolean}

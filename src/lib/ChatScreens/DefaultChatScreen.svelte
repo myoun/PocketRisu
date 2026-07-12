@@ -66,11 +66,21 @@ import { isMobile } from 'src/ts/platform'
 
     let messageInput:string = $state('')
     let messageInputTranslate:string = $state('')
+    let inputTranslationSerial = 0
+    let autoSuggestionInsertSerial = 0
     let openMenu = $state(false)
     let loadPages = $state(getInitialChatLoadPages(DBState.db))
     let doingChatInputTranslate = false
     let toggleStickers:boolean = $state(false)
     let fileInput:string[] = $state([])
+    let autoSuggestionGenerationToken = 0
+    let autoSuggestionGenerationSignal = $state<{
+        token: number
+        success: boolean
+        characterId: string
+        chatId?: string
+        chatPage: number
+    } | null>(null)
     let showNewMessageButton = $state(false)
     let showScrollNav = $state(false)
     let scrollNavTimer: ReturnType<typeof setTimeout> | null = null
@@ -341,6 +351,7 @@ import { isMobile } from 'src/ts/platform'
         if(messageInput.startsWith('/')){
             const commandProcessed = await processMultiCommand(messageInput)
             if(commandProcessed !== false){
+                inputTranslationSerial += 1
                 messageInput = ''
                 messageInputTranslate = ''
                 removeChatDraft(draftChaId, draftChatId)
@@ -390,6 +401,7 @@ import { isMobile } from 'src/ts/platform'
                 })
             }
         }
+        inputTranslationSerial += 1
         messageInput = ''
         messageInputTranslate = ''
         removeChatDraft(draftChaId, draftChatId)
@@ -558,6 +570,7 @@ import { isMobile } from 'src/ts/platform'
 
     async function sendChatMain(continued:boolean = false) {
 
+        inputTranslationSerial += 1
         messageInput = ''
         const genKey = currentChatGenKey()
         // Mirror sendChat's per-chat guard BEFORE any side effects: a blocked
@@ -567,6 +580,9 @@ import { isMobile } from 'src/ts/platform'
         if ($generationStates.has(genKey)) {
             return false
         }
+        const generationCharacter = DBState.db.characters[$selectedCharID]
+        const generationChatPage = generationCharacter?.chatPage ?? -1
+        const generationChat = generationCharacter?.chats?.[generationChatPage]
         const abortController = new AbortController()
         registerAbort(genKey, abortController)
         let generated = false
@@ -583,6 +599,15 @@ import { isMobile } from 'src/ts/platform'
         // Send concluded on THIS client (success, failure or abort alike) —
         // drop the resumable-send tombstone so no later boot re-runs it.
         clearPendingSend(genKey)
+        if(generationCharacter && generationChat){
+            autoSuggestionGenerationSignal = {
+                token: ++autoSuggestionGenerationToken,
+                success: generated,
+                characterId: generationCharacter.chaId,
+                chatId: generationChat.id,
+                chatPage: generationChatPage,
+            }
+        }
         if(DBState.db.playMessage){
             playNotificationSound(DBState.db.messageSound, DBState.db.messageSoundVolume)
         }
@@ -756,50 +781,91 @@ import { isMobile } from 'src/ts/platform'
         updateInputSizeAll()
     });
 
-    async function updateInputTransateMessage(reverse: boolean) {
+    async function updateInputTransateMessage(reverse: boolean): Promise<boolean> {
+        const serial = ++inputTranslationSerial
         if(!DBState.db.useAutoTranslateInput){
-            return
+            return false
         }
         if(isExpTranslator()){
             if(!reverse){
                 messageInputTranslate = ''
-                return
+                return true
             }
             if(messageInputTranslate === '') {
                 messageInput = ''
-                return
+                return true
             }
             const lastMessageInputTranslate = messageInputTranslate
             await sleep(1500)
-            if(lastMessageInputTranslate === messageInputTranslate){
-                translate(reverse ? messageInputTranslate : messageInput, reverse).then((translatedMessage) => {
-                    if(translatedMessage){
-                        if(reverse)
-                            messageInput = translatedMessage
-                        else
-                            messageInputTranslate = translatedMessage
-                    }
-                })
-            }
-            return
-
-        }
-        if(reverse && messageInputTranslate === '') {
-            messageInput = ''
-            return
-        }
-        if(!reverse && messageInput === '') {
-            messageInputTranslate = ''
-            return
-        }
-        translate(reverse ? messageInputTranslate : messageInput, reverse).then((translatedMessage) => {
-            if(translatedMessage){
+            if(serial !== inputTranslationSerial || lastMessageInputTranslate !== messageInputTranslate) return false
+            const source = reverse ? messageInputTranslate : messageInput
+            const translatedMessage = await translate(source, reverse)
+            if(serial === inputTranslationSerial && source === (reverse ? messageInputTranslate : messageInput) && translatedMessage){
                 if(reverse)
                     messageInput = translatedMessage
                 else
                     messageInputTranslate = translatedMessage
+                await tick()
+                updateInputSizeAll()
             }
-        })
+            return serial === inputTranslationSerial && source === (reverse ? messageInputTranslate : messageInput)
+        }
+        if(reverse && messageInputTranslate === '') {
+            messageInput = ''
+            return true
+        }
+        if(!reverse && messageInput === '') {
+            messageInputTranslate = ''
+            return true
+        }
+        const source = reverse ? messageInputTranslate : messageInput
+        const translatedMessage = await translate(source, reverse)
+        if(serial !== inputTranslationSerial || source !== (reverse ? messageInputTranslate : messageInput)) return false
+        if(translatedMessage){
+            if(reverse)
+                messageInput = translatedMessage
+            else
+                messageInputTranslate = translatedMessage
+            await tick()
+            updateInputSizeAll()
+        }
+        return true
+    }
+
+    function focusComposerInput(element: HTMLTextAreaElement | undefined) {
+        if(!element) return
+        element.focus()
+        element.selectionStart = element.selectionEnd = element.value.length
+    }
+
+    async function insertAutoSuggestion(msg: string) {
+        const insertSerial = ++autoSuggestionInsertSerial
+        const cleaned = (
+            (DBState.db.subModel === "textgen_webui" || DBState.db.subModel === "mancer" || DBState.db.subModel.startsWith('local_')) && DBState.db.autoSuggestClean
+                ? msg.replace(/ +\(.+?\) *$| - [^"'*]*?$/, '')
+                : msg
+        )
+        if(DBState.db.autoSuggestToTranslatedInput
+            && DBState.db.useAutoTranslateInput
+            && DBState.db.characters[$selectedCharID]?.chaId !== '§playground'){
+            messageInputTranslate = cleaned
+            await tick()
+            updateInputSizeAll()
+            const synchronized = await updateInputTransateMessage(true)
+            if(insertSerial === autoSuggestionInsertSerial && synchronized){
+                focusComposerInput(inputTranslateEle)
+            }
+            return
+        }
+        inputTranslationSerial += 1
+        messageInput = cleaned
+        await tick()
+        updateInputSizeAll()
+        if(DBState.db.useAutoTranslateInput){
+            const synchronized = await updateInputTransateMessage(false)
+            if(insertSerial !== autoSuggestionInsertSerial || !synchronized) return
+        }
+        if(insertSerial === autoSuggestionInsertSerial) focusComposerInput(inputEle)
     }
 
     async function screenShot(){
@@ -1252,11 +1318,9 @@ import { isMobile } from 'src/ts/platform'
             {/if}
 
             {#if DBState.db.useAutoSuggestions}
-                <Suggestion messageInput={(msg)=>messageInput=(
-                    (DBState.db.subModel === "textgen_webui" || DBState.db.subModel === "mancer" || DBState.db.subModel.startsWith('local_')) && DBState.db.autoSuggestClean
-                    ? msg.replace(/ +\(.+?\) *$| - [^"'*]*?$/, '')
-                    : msg
-                )} {send}/>
+                <div class="mx-auto mt-2 w-full {composerWidthClass} px-2">
+                    <Suggestion generationSignal={autoSuggestionGenerationSignal} messageInput={insertAutoSuggestion}/>
+                </div>
             {/if}
         {/snippet}
 

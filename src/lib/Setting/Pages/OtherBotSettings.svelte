@@ -22,6 +22,7 @@
     import { PlusIcon, PencilIcon, TrashIcon, DownloadIcon, HardDriveUploadIcon } from "@lucide/svelte";
     import { alertError, alertInput, alertConfirm, notifySuccess, notifyError } from "src/ts/alert";
     import { createHypaV3Preset } from "src/ts/process/memory/hypav3";
+    import { defaultAutoSuggestPrompt } from "src/ts/storage/defaultPrompts";
 
 
     // HypaV3
@@ -228,7 +229,77 @@
     { label: 'TTS', value: 1 },
     { label: language.emotionImage, value: 2 },
     { label: language.imageGeneration, value: 3 },
+    { label: language.autoSuggest, value: 4 },
 ]} bind:selected={$OtherBotsSubmenuIndex} />
+
+{#if $OtherBotsSubmenuIndex === 4}
+    <Accordion name={language.autoSuggest} styled disabled>
+        <div class="mt-4">
+            <span class="text-textcolor">{language.autoSuggestMessageCount}</span>
+            <NumberInput
+                className="mt-2"
+                marginBottom
+                min={1}
+                max={100}
+                bind:value={DBState.db.autoSuggestMessageCount}
+            />
+        </div>
+        <div class="mt-4">
+            <span class="text-textcolor">{language.autoSuggestCount}</span>
+            <NumberInput
+                className="mt-2"
+                marginBottom
+                min={1}
+                max={10}
+                bind:value={DBState.db.autoSuggestCount}
+            />
+        </div>
+        <div class="mt-4">
+            <span class="text-textcolor">{language.autoSuggestLanguage}</span>
+            <SelectInput className="mt-2 mb-4" bind:value={DBState.db.autoSuggestLanguage}>
+                <OptionInput value="risu">{language.followRisuLanguage}</OptionInput>
+                <OptionInput value="en">English</OptionInput>
+                <OptionInput value="ko">한국어</OptionInput>
+                <OptionInput value="cn">简体中文</OptionInput>
+                <OptionInput value="zh-Hant">繁體中文</OptionInput>
+                <OptionInput value="de">Deutsch</OptionInput>
+                <OptionInput value="es">Español</OptionInput>
+                <OptionInput value="vi">Tiếng Việt</OptionInput>
+                <OptionInput value="custom">{language.customLanguage}</OptionInput>
+            </SelectInput>
+        </div>
+        {#if DBState.db.autoSuggestLanguage === 'custom'}
+            <TextInput
+                className="mb-4"
+                bind:value={DBState.db.autoSuggestCustomLanguage}
+                placeholder={language.customLanguage}
+            />
+        {/if}
+        <Check
+            bind:check={DBState.db.autoSuggestToTranslatedInput}
+            name={language.autoSuggestToTranslatedInput}
+        />
+        <Check
+            bind:check={DBState.db.useGlobalAutoSuggestPrompt}
+            name={language.useGlobalAutoSuggestPrompt}
+        />
+        <fieldset
+            disabled={!DBState.db.useGlobalAutoSuggestPrompt}
+            class="mt-4 transition-opacity"
+            class:opacity-50={!DBState.db.useGlobalAutoSuggestPrompt}
+        >
+            <span class="text-textcolor">
+                {language.globalAutoSuggestPrompt}
+                <Help key="autoSuggest"/>
+            </span>
+            <TextAreaInput
+                className="mt-2 mb-4"
+                bind:value={DBState.db.globalAutoSuggestPrompt}
+                placeholder={defaultAutoSuggestPrompt}
+            />
+        </fieldset>
+    </Accordion>
+{/if}
 
 {#if $OtherBotsSubmenuIndex === 3}
     <Accordion name={language.imageGeneration} styled disabled>
