@@ -26,14 +26,6 @@ type CodexInputItem =
     | { type: 'function_call'; id: string; call_id: string; name: string; arguments: string }
     | { type: 'function_call_output'; call_id: string; output: string }
 
-interface CodexFunctionCall {
-    type: 'function_call'
-    id?: unknown
-    call_id?: unknown
-    name?: unknown
-    arguments?: unknown
-}
-
 /** ChatGPT Codex Responses API adapter. OAuth/session ownership stays in the
  * separate Codex Manager plugin; this module only converts model-preset turns
  * to the Responses wire format and parses its JSON/SSE output. */
@@ -244,10 +236,13 @@ function collectToolCalls(node: unknown, seen = new Set<object>()): AdapterToolC
     const calls: AdapterToolCall[] = []
     visit(node, seen, (value) => {
         if (value.type !== 'function_call') return
-        const call = value as CodexFunctionCall
-        const id = typeof call.call_id === 'string' ? call.call_id : typeof call.id === 'string' ? call.id : ''
-        if (id && typeof call.name === 'string') {
-            calls.push({ id, name: call.name, arguments: typeof call.arguments === 'string' ? call.arguments : '{}' })
+        const id = typeof value.call_id === 'string' ? value.call_id : typeof value.id === 'string' ? value.id : ''
+        if (id && typeof value.name === 'string') {
+            calls.push({
+                id,
+                name: value.name,
+                arguments: typeof value.arguments === 'string' ? value.arguments : '{}',
+            })
         }
     })
     return calls
@@ -304,9 +299,7 @@ function numberValue(value: unknown): number | undefined {
 async function deriveHttpError(response: Response): Promise<ModelPresetAdapterError> {
     let text = ''
     try { text = await response.text() } catch { /* preserve status fallback */ }
-    return new ModelPresetAdapterError(
-        normalizeHttpStatus(response.status),
-        extractErrorMessage(text) ?? `Codex Responses request failed (${response.status})`,
-        { status: response.status },
-    )
+    const message = extractErrorMessage(text) ?? `Codex Responses request failed (${response.status})`
+    return normalizeHttpStatus(response.status, message)
+        ?? new ModelPresetAdapterError('unknown', message, { status: response.status })
 }

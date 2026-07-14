@@ -53,4 +53,51 @@ describe('Codex Responses adapter', () => {
             expect.objectContaining({ usage: { promptTokens: 1, completionTokens: 1 } }),
         ])
     })
+
+    test('parses completed function calls without unsafe response casts', async () => {
+        const body = 'data: {"type":"response.completed","response":{"output":['
+            + '{"type":"function_call","call_id":"call-1","name":"lookup","arguments":"{\\"q\\":\\"risu\\"}"},'
+            + '{"type":"function_call","id":"call-2","name":"fallback_id"}'
+            + ']}}\n\n'
+            + 'data: [DONE]\n\n'
+        const fetchImpl = async () => new Response(body, { headers: { 'Content-Type': 'text/event-stream' } })
+
+        const result = await sendCodexResponsesRequest(
+            preset(),
+            options(fetchImpl as typeof fetch),
+            { apiKey: 'access' },
+        )
+
+        expect(result.toolCalls).toEqual([
+            { id: 'call-1', name: 'lookup', arguments: '{"q":"risu"}' },
+            { id: 'call-2', name: 'fallback_id', arguments: '{}' },
+        ])
+    })
+
+    test.each([
+        { status: 500, kind: 'server', retryable: true, fallbackEligible: true },
+        { status: 401, kind: 'auth', retryable: false, fallbackEligible: false },
+    ] as const)('classifies HTTP $status errors as $kind', async ({
+        status,
+        kind,
+        retryable,
+        fallbackEligible,
+    }) => {
+        const fetchImpl = async () => new Response(
+            JSON.stringify({ error: { message: 'request failed' } }),
+            { status },
+        )
+
+        await expect(sendCodexResponsesRequest(
+            preset(),
+            options(fetchImpl as typeof fetch),
+            { apiKey: 'access' },
+        )).rejects.toMatchObject({
+            kind,
+            status,
+            message: 'request failed',
+            retryable,
+            fallbackEligible,
+        })
+    })
 })
