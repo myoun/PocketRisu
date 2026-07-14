@@ -423,6 +423,8 @@ export function setDatabase(data:Database){
     data.autoSuggestLanguage ??= 'risu'
     data.autoSuggestCustomLanguage ??= ''
     data.autoSuggestToTranslatedInput ??= false
+    data.autoSuggestIncludePersona ??= false
+    data.autoSuggestIncludeLorebook ??= false
     data.autoSuggestPrefix ??= ""
     data.OAIPrediction ??= ''
     data.autoSuggestClean ??= true
@@ -1173,6 +1175,8 @@ export interface Database{
     autoSuggestLanguage:string
     autoSuggestCustomLanguage:string
     autoSuggestToTranslatedInput:boolean
+    autoSuggestIncludePersona:boolean
+    autoSuggestIncludeLorebook:boolean
     autoSuggestPrefix:string
     autoSuggestClean:boolean
     claudeAPIKey:string,

@@ -276,6 +276,15 @@
             />
         {/if}
         <Check
+            bind:check={DBState.db.autoSuggestIncludePersona}
+            name={language.autoSuggestIncludePersona}
+        />
+        <Check
+            bind:check={DBState.db.autoSuggestIncludeLorebook}
+            name={language.autoSuggestIncludeLorebook}
+        />
+        <p class="mb-4 text-xs leading-5 text-textcolor2">{language.autoSuggestReferencePrivacy}</p>
+        <Check
             bind:check={DBState.db.autoSuggestToTranslatedInput}
             name={language.autoSuggestToTranslatedInput}
         />
