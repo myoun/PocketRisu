@@ -766,20 +766,9 @@ app.use('/assets', express.static(path.join(process.cwd(), 'dist/assets'), {
     immutable: true,
 }));
 app.use(express.static(path.join(process.cwd(), 'dist'), {index: false, maxAge: 0}));
-app.use(express.json({ limit: '100mb' }));
-app.use((req, res, next) => {
-    // Skip express.raw() for backup import — it must stream, not buffer into memory
-    if (req.path === '/api/backup/import') return next();
-    return express.raw({ type: 'application/octet-stream', limit: '2gb' })(req, res, next);
-});
-app.use(express.text({ limit: '100mb' }));
-const {pipeline} = require('stream/promises')
-const sslPath = path.join(process.cwd(), 'server/node/ssl/certificate');
-const hubURL = 'https://sv.risuai.xyz';
-
-let password = ''
-
-// Ensure /save/ exists for password file and migration source
+// MCP routes are registered before the application's large body parsers so
+// disabled servers and invalid credentials are rejected without buffering a
+// request body. MCP JSON messages have their own deliberately small limit.
 const savePath = path.join(process.cwd(), "save")
 if(!existsSync(savePath)){
     mkdirSync(savePath)
@@ -827,7 +816,7 @@ const externalMcpTransport = createMcpTransport({
         },
         {
             name: 'pocketrisu.list_characters',
-            description: 'List PocketRisu characters without chat message contents.',
+            description: 'List lightweight PocketRisu character summaries without descriptions or chat contents.',
             inputSchema: { type: 'object', properties: {}, additionalProperties: false },
             scope: 'risu.read',
             handler: async () => {
@@ -839,7 +828,6 @@ const externalMcpTransport = createMcpTransport({
                 const characters = (db.characters || []).map((character) => ({
                     id: character.chaId || character.id || null,
                     name: character.name || '',
-                    description: character.desc || character.description || '',
                     chatCount: Array.isArray(character.chats) ? character.chats.length : 0,
                 }))
                 return {
@@ -848,9 +836,57 @@ const externalMcpTransport = createMcpTransport({
                 }
             },
         },
+        {
+            name: 'pocketrisu.get_character',
+            description: 'Get one PocketRisu character including its description, without chat message contents.',
+            inputSchema: {
+                type: 'object',
+                properties: {
+                    id: { type: 'string', description: 'Character ID returned by pocketrisu.list_characters.' },
+                },
+                required: ['id'],
+                additionalProperties: false,
+            },
+            scope: 'risu.read',
+            handler: async ({ id }) => {
+                if (typeof id !== 'string' || !id) throw new Error('Character id is required')
+                const raw = kvGet('database/database.bin')
+                if (!raw) throw new Error('Character not found')
+                const db = await decodeDatabaseWithPersistentChatIds(raw)
+                const character = (db.characters || []).find((candidate) =>
+                    (candidate.chaId || candidate.id || null) === id)
+                if (!character) throw new Error('Character not found')
+                const detail = {
+                    id: character.chaId || character.id || null,
+                    name: character.name || '',
+                    description: character.desc || character.description || '',
+                    chatCount: Array.isArray(character.chats) ? character.chats.length : 0,
+                }
+                return {
+                    content: [{ type: 'text', text: JSON.stringify(detail, null, 2) }],
+                    structuredContent: { character: detail },
+                }
+            },
+        },
     ],
 })
-externalMcpTransport.attach(app)
+externalMcpTransport.attach(app, {
+    jsonParser: express.json({ limit: '1mb' }),
+})
+
+app.use(express.json({ limit: '100mb' }));
+app.use((req, res, next) => {
+    // Skip express.raw() for backup import — it must stream, not buffer into memory
+    if (req.path === '/api/backup/import') return next();
+    return express.raw({ type: 'application/octet-stream', limit: '2gb' })(req, res, next);
+});
+app.use(express.text({ limit: '100mb' }));
+const {pipeline} = require('stream/promises')
+const sslPath = path.join(process.cwd(), 'server/node/ssl/certificate');
+const hubURL = 'https://sv.risuai.xyz';
+
+let password = ''
+
 
 // Server-side backup directory (outside save/ to avoid bloating updater copies).
 // Configurable at runtime via the kv key `config/server-backup-path`. When the

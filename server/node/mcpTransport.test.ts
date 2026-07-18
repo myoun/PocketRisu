@@ -11,17 +11,24 @@ afterEach(async () => {
     await Promise.all(servers.splice(0).map((server) => new Promise<void>((resolve) => server.close(() => resolve()))))
 })
 
-function createTestServer(options: { enabled?: boolean; requireAuth?: boolean } = {}) {
+function createTestServer(options: { enabled?: boolean; requireAuth?: boolean; jsonLimit?: string } = {}) {
     const config = { enabled: options.enabled ?? true, requireAuth: options.requireAuth ?? true }
-    const token = { id: 'token-1', scopes: ['risu.read'], name: 'test' }
+    const tokens: Record<string, { id: string; scopes: string[]; name: string }> = {
+        'good-token': { id: 'token-read', scopes: ['risu.read'], name: 'reader' },
+        'write-token': { id: 'token-write', scopes: ['risu.write'], name: 'writer' },
+    }
     const app = express()
-    app.use(express.json())
     const transport = createMcpTransport({
         configStore: { get: () => ({ ...config }) },
         tokenStore: {
-            authenticate: (raw: string, scope: string) => raw === 'good-token' && scope === 'risu.read'
-                ? { status: 'ok', token }
-                : { status: 'invalid' },
+            authenticate: (raw: string, scope: string | null) => {
+                const token = tokens[raw]
+                if (!token) return { status: 'invalid' }
+                if (scope && !token.scopes.includes('risu.admin') && !token.scopes.includes(scope)) {
+                    return { status: 'insufficient_scope' }
+                }
+                return { status: 'ok', token }
+            },
         },
         serverName: 'PocketRisu Test',
         serverVersion: '1.2.3',
@@ -29,17 +36,31 @@ function createTestServer(options: { enabled?: boolean; requireAuth?: boolean } 
             let n = 0
             return () => `session-${++n}`
         })(),
-        tools: [{
-            name: 'test.echo',
-            description: 'Echo input',
-            inputSchema: { type: 'object' },
-            scope: 'risu.read',
-            handler: async (args: unknown) => ({
-                content: [{ type: 'text', text: JSON.stringify(args) }],
-            }),
-        }],
+        tools: [
+            {
+                name: 'test.echo',
+                description: 'Echo input',
+                inputSchema: { type: 'object' },
+                scope: 'risu.read',
+                handler: async (args: unknown) => ({
+                    content: [{ type: 'text', text: JSON.stringify(args) }],
+                }),
+            },
+            {
+                name: 'test.write',
+                description: 'Write input',
+                inputSchema: { type: 'object' },
+                scope: 'risu.write',
+                handler: async () => ({ content: [{ type: 'text', text: 'written' }] }),
+            },
+        ],
     })
-    transport.attach(app)
+    transport.attach(app, {
+        jsonParser: express.json({ limit: options.jsonLimit ?? '1kb' }),
+    })
+    app.use((error: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+        res.status(error?.status || 500).json({ error: String(error?.message || error) })
+    })
     const server = app.listen(0)
     servers.push(server)
     const address = server.address()
@@ -47,22 +68,40 @@ function createTestServer(options: { enabled?: boolean; requireAuth?: boolean } 
     return { base: `http://127.0.0.1:${address.port}`, transport }
 }
 
-async function initialize(base: string, accept = 'application/json') {
-    const response = await fetch(`${base}/mcp`, {
+async function initialize(
+    base: string,
+    options: { accept?: string; token?: string; protocolVersion?: string; protocolHeader?: string } = {},
+) {
+    const headers: Record<string, string> = {
+        Authorization: `Bearer ${options.token ?? 'good-token'}`,
+        Accept: options.accept ?? 'application/json',
+        'Content-Type': 'application/json',
+    }
+    if (options.protocolHeader !== undefined) headers['Mcp-Protocol-Version'] = options.protocolHeader
+    return fetch(`${base}/mcp`, {
         method: 'POST',
-        headers: {
-            Authorization: 'Bearer good-token',
-            Accept: accept,
-            'Content-Type': 'application/json',
-        },
+        headers,
         body: JSON.stringify({
             jsonrpc: '2.0',
             id: 1,
             method: 'initialize',
-            params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'test', version: '1' } },
+            params: {
+                protocolVersion: options.protocolVersion ?? '2025-11-25',
+                capabilities: {},
+                clientInfo: { name: 'test', version: '1' },
+            },
         }),
     })
-    return response
+}
+
+function sessionHeaders(sessionId: string, token = 'good-token') {
+    return {
+        Authorization: `Bearer ${token}`,
+        Accept: 'application/json, text/event-stream',
+        'Content-Type': 'application/json',
+        'Mcp-Session-Id': sessionId,
+        'Mcp-Protocol-Version': '2025-11-25',
+    }
 }
 
 describe('external MCP transports', () => {
@@ -71,16 +110,14 @@ describe('external MCP transports', () => {
         const init = await initialize(base)
         expect(init.status).toBe(200)
         expect(init.headers.get('mcp-session-id')).toBe('session-1')
-        expect((await init.json() as any).result.protocolVersion).toBe('2025-06-18')
+        expect((await init.json() as any).result.protocolVersion).toBe('2025-11-25')
 
         const sessionId = init.headers.get('mcp-session-id')!
         const list = await fetch(`${base}/mcp`, {
             method: 'POST',
             headers: {
-                Authorization: 'Bearer good-token',
+                ...sessionHeaders(sessionId),
                 Accept: 'text/event-stream',
-                'Content-Type': 'application/json',
-                'Mcp-Session-Id': sessionId,
             },
             body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list' }),
         })
@@ -133,5 +170,84 @@ describe('external MCP transports', () => {
         })
         expect(response.status).toBe(401)
         expect(response.headers.get('www-authenticate')).toBe('Bearer')
+    })
+
+    it('returns 400 for a missing session ID and 404 for an unknown session ID', async () => {
+        const { base } = createTestServer()
+        const body = JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list' })
+
+        const missing = await fetch(`${base}/mcp`, {
+            method: 'POST',
+            headers: {
+                Authorization: 'Bearer good-token',
+                'Content-Type': 'application/json',
+                'Mcp-Protocol-Version': '2025-11-25',
+            },
+            body,
+        })
+        expect(missing.status).toBe(400)
+
+        const unknown = await fetch(`${base}/mcp`, {
+            method: 'POST',
+            headers: sessionHeaders('lost-session'),
+            body,
+        })
+        expect(unknown.status).toBe(404)
+    })
+
+    it('rejects unsupported protocol headers and supports the latest stable version', async () => {
+        const { base } = createTestServer()
+        const invalid = await initialize(base, { protocolHeader: '2099-01-01' })
+        expect(invalid.status).toBe(400)
+
+        const latest = await initialize(base, { protocolVersion: '2025-11-25' })
+        expect(latest.status).toBe(200)
+        expect((await latest.json() as any).result.protocolVersion).toBe('2025-11-25')
+    })
+
+    it('allows a write-only token to connect and exposes only write-scoped tools', async () => {
+        const { base } = createTestServer()
+        const init = await initialize(base, { token: 'write-token' })
+        expect(init.status).toBe(200)
+        const sessionId = init.headers.get('mcp-session-id')!
+
+        const list = await fetch(`${base}/mcp`, {
+            method: 'POST',
+            headers: { ...sessionHeaders(sessionId, 'write-token'), Accept: 'application/json' },
+            body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list' }),
+        })
+        expect(list.status).toBe(200)
+        const payload = await list.json() as any
+        expect(payload.result.tools.map((tool: any) => tool.name)).toEqual(['test.write'])
+    })
+
+    it('authenticates before parsing and enforces the MCP-specific body limit', async () => {
+        const { base } = createTestServer({ jsonLimit: '1kb' })
+        const oversizedBody = JSON.stringify({
+            jsonrpc: '2.0',
+            id: 1,
+            method: 'initialize',
+            params: { protocolVersion: '2025-11-25', padding: 'x'.repeat(4_000) },
+        })
+
+        const unauthorized = await fetch(`${base}/mcp`, {
+            method: 'POST',
+            headers: {
+                Authorization: 'Bearer bad-token',
+                'Content-Type': 'application/json',
+            },
+            body: oversizedBody,
+        })
+        expect(unauthorized.status).toBe(401)
+
+        const authorized = await fetch(`${base}/mcp`, {
+            method: 'POST',
+            headers: {
+                Authorization: 'Bearer good-token',
+                'Content-Type': 'application/json',
+            },
+            body: oversizedBody,
+        })
+        expect(authorized.status).toBe(413)
     })
 })

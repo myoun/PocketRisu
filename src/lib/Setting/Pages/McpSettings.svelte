@@ -36,6 +36,11 @@
     };
 
     let tokens = $state<McpToken[]>([]);
+    let showRevokedTokens = $state(false);
+    let visibleTokens = $derived(tokens.filter((token) => showRevokedTokens || token.revokedAt === null));
+    let activeTokenCount = $derived(tokens.filter((token) => tokenStatus(token) === 'active').length);
+    let expiredTokenCount = $derived(tokens.filter((token) => tokenStatus(token) === 'expired').length);
+    let revokedTokenCount = $derived(tokens.filter((token) => tokenStatus(token) === 'revoked').length);
     let loading = $state(true);
     let loadError = $state(false);
     let configLoading = $state(true);
@@ -56,6 +61,8 @@
     let createdToken = $state('');
     let createdTokenOpen = $state(false);
     let copied = $state(false);
+    let mcpEndpoint = $state('/mcp');
+    let endpointCopied = $state(false);
 
     async function authHeaders(includeJson = false) {
         const auth = await forageStorage.createAuth();
@@ -222,26 +229,41 @@
         }
     }
 
+    async function writeClipboard(value: string) {
+        if (navigator.clipboard) {
+            await navigator.clipboard.writeText(value);
+            return;
+        }
+        const textarea = document.createElement('textarea');
+        textarea.value = value;
+        textarea.style.position = 'fixed';
+        textarea.style.opacity = '0';
+        document.body.appendChild(textarea);
+        textarea.select();
+        document.execCommand('copy');
+        textarea.remove();
+    }
+
     async function copyToken() {
         if (!createdToken) return;
         try {
-            if (navigator.clipboard) {
-                await navigator.clipboard.writeText(createdToken);
-            } else {
-                const textarea = document.createElement('textarea');
-                textarea.value = createdToken;
-                textarea.style.position = 'fixed';
-                textarea.style.opacity = '0';
-                document.body.appendChild(textarea);
-                textarea.select();
-                document.execCommand('copy');
-                textarea.remove();
-            }
+            await writeClipboard(createdToken);
             copied = true;
             notifySuccess(language.mcpTokenCopied);
             setTimeout(() => { copied = false; }, 2000);
         } catch {
             notifyError(language.mcpTokenCopyFailed);
+        }
+    }
+
+    async function copyEndpoint() {
+        try {
+            await writeClipboard(mcpEndpoint);
+            endpointCopied = true;
+            notifySuccess(language.mcpEndpointCopied);
+            setTimeout(() => { endpointCopied = false; }, 2000);
+        } catch {
+            notifyError(language.mcpEndpointCopyFailed);
         }
     }
 
@@ -287,6 +309,9 @@
     }
 
     $effect(() => {
+        if (typeof window !== 'undefined') {
+            mcpEndpoint = new URL('/mcp', window.location.origin).toString();
+        }
         loadConfig();
         loadTokens();
     });
@@ -328,6 +353,19 @@
             </ShAlert>
         {/if}
 
+        <div class="flex flex-col gap-2 rounded-lg border border-darkborderc bg-darkbg p-4">
+            <div class="flex flex-col gap-0.5">
+                <span class="font-medium text-textcolor">{language.mcpEndpoint}</span>
+                <span class="text-xs text-textcolor2">{language.mcpEndpointDesc}</span>
+            </div>
+            <div class="flex items-center gap-2">
+                <ShInput value={mcpEndpoint} readonly className="font-mono text-sm select-all" />
+                <ShButton size="icon" onclick={copyEndpoint} aria-label={language.mcpCopyEndpoint} title={language.mcpCopyEndpoint}>
+                    {#if endpointCopied}<CheckIcon size={17} />{:else}<CopyIcon size={17} />{/if}
+                </ShButton>
+            </div>
+        </div>
+
         <div class="flex items-center justify-between gap-3">
             <div class="flex flex-col gap-0.5">
                 <h3 class="font-semibold text-textcolor">{language.mcpAccessTokens}</h3>
@@ -337,6 +375,16 @@
                 <PlusIcon size={15} />
                 {language.mcpCreateToken}
             </ShButton>
+        </div>
+
+        <div class="flex items-center justify-between gap-3 rounded-lg border border-darkborderc bg-darkbg px-3 py-2.5">
+            <span class="text-xs text-textcolor2">
+                {language.mcpTokenCounts(activeTokenCount, expiredTokenCount, revokedTokenCount)}
+            </span>
+            <label class="flex cursor-pointer items-center gap-2 text-sm text-textcolor">
+                <span>{language.mcpShowRevokedTokens}</span>
+                <ShSwitch bind:checked={showRevokedTokens} size="sm" />
+            </label>
         </div>
 
         {#if loading}
@@ -357,9 +405,15 @@
                 <p class="text-sm font-medium text-textcolor">{language.mcpNoTokens}</p>
                 <p class="text-xs text-textcolor2">{language.mcpNoTokensDesc}</p>
             </div>
+        {:else if visibleTokens.length === 0}
+            <div class="flex flex-col items-center justify-center gap-2 rounded-lg border border-dashed border-darkborderc bg-darkbg/40 px-4 py-10 text-center">
+                <KeyRoundIcon class="text-textcolor2" size={28} />
+                <p class="text-sm font-medium text-textcolor">{language.mcpNoActiveTokens}</p>
+                <p class="text-xs text-textcolor2">{language.mcpNoActiveTokensDesc}</p>
+            </div>
         {:else}
             <div class="flex flex-col gap-3">
-                {#each tokens as token (token.id)}
+                {#each visibleTokens as token (token.id)}
                     {@const status = tokenStatus(token)}
                     <div class="rounded-lg border border-darkborderc bg-darkbg p-4">
                         <div class="flex items-start justify-between gap-3">

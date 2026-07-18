@@ -2,8 +2,10 @@
 
 const crypto = require('crypto')
 
-const SUPPORTED_PROTOCOLS = new Set(['2025-06-18', '2025-03-26', '2024-11-05'])
-const DEFAULT_PROTOCOL = '2025-06-18'
+const SUPPORTED_PROTOCOLS = new Set(['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'])
+const DEFAULT_PROTOCOL = '2025-11-25'
+const MCP_AUTH = Symbol('mcpAuth')
+const MCP_PROTOCOL = Symbol('mcpProtocol')
 
 function jsonRpcError(id, code, message, data) {
     const error = { code, message }
@@ -74,7 +76,7 @@ function createMcpTransport({
         }
     }
 
-    function authenticate(req, requiredScope = 'risu.read') {
+    function authenticate(req, requiredScope = null) {
         const config = configStore.get()
         if (!config.enabled) return { ok: false, status: 404, message: 'MCP server is disabled' }
         if (!validateOrigin(req)) return { ok: false, status: 403, message: 'Invalid Origin header' }
@@ -93,6 +95,30 @@ function createMcpTransport({
         res.status(auth.status).json({ error: auth.message })
     }
 
+    function authMiddleware(req, res, next) {
+        const auth = authenticate(req)
+        if (!auth.ok) return rejectAuth(res, auth)
+        req[MCP_AUTH] = auth
+        next()
+    }
+
+    function validateProtocolVersionHeader(req) {
+        const raw = req.headers['mcp-protocol-version']
+        if (raw === undefined) return { ok: true, version: null }
+        const version = String(Array.isArray(raw) ? raw[0] : raw).trim()
+        if (!version || !SUPPORTED_PROTOCOLS.has(version)) {
+            return { ok: false, status: 400, message: `Unsupported MCP protocol version: ${version || '(empty)'}` }
+        }
+        return { ok: true, version }
+    }
+
+    function protocolMiddleware(req, res, next) {
+        const protocol = validateProtocolVersionHeader(req)
+        if (!protocol.ok) return res.status(protocol.status).json({ error: protocol.message })
+        req[MCP_PROTOCOL] = protocol
+        next()
+    }
+
     function createSession(protocolVersion, principal = null) {
         pruneSessions()
         const id = randomUUID()
@@ -109,12 +135,19 @@ function createMcpTransport({
         return session
     }
 
-    function getSession(req) {
-        const id = String(req.headers['mcp-session-id'] || req.query?.sessionId || '')
-        if (!id) return null
+    function sessionIdFor(req) {
+        const raw = req.headers['mcp-session-id'] ?? req.query?.sessionId
+        if (raw === undefined || raw === null) return ''
+        return String(Array.isArray(raw) ? raw[0] : raw)
+    }
+
+    function lookupSession(req) {
+        pruneSessions()
+        const id = sessionIdFor(req)
+        if (!id) return { id: '', session: null }
         const session = sessions.get(id) || null
         if (session) session.updatedAt = now()
-        return session
+        return { id, session }
     }
 
     function toolDefinitionsFor(principal) {
@@ -182,14 +215,28 @@ function createMcpTransport({
     }
 
     async function handleMessage(req, res, { legacy = false } = {}) {
-        const auth = authenticate(req)
+        const auth = req[MCP_AUTH] || authenticate(req)
         if (!auth.ok) return rejectAuth(res, auth)
+        if (!legacy) {
+            const protocol = req[MCP_PROTOCOL] || validateProtocolVersionHeader(req)
+            if (!protocol.ok) return res.status(protocol.status).json(jsonRpcError(req.body?.id, -32000, protocol.message))
+        }
 
-        let session = getSession(req)
+        const lookup = lookupSession(req)
+        let session = lookup.session
         const isInitialize = req.body?.method === 'initialize'
-        if (!session && isInitialize) session = createSession(req.body?.params?.protocolVersion || DEFAULT_PROTOCOL, auth.principal)
-        if (!session && !legacy) return res.status(400).json(jsonRpcError(req.body?.id, -32000, 'Missing or invalid MCP session'))
-        if (!session && legacy) return res.status(404).json(jsonRpcError(req.body?.id, -32000, 'Unknown SSE session'))
+        if (!legacy && !lookup.id && isInitialize) {
+            session = createSession(req.body?.params?.protocolVersion || DEFAULT_PROTOCOL, auth.principal)
+        }
+        if (!session && legacy) {
+            return res.status(404).json(jsonRpcError(req.body?.id, -32000, 'Unknown SSE session'))
+        }
+        if (!session && !lookup.id) {
+            return res.status(400).json(jsonRpcError(req.body?.id, -32000, 'Mcp-Session-Id header required'))
+        }
+        if (!session) {
+            return res.status(404).json(jsonRpcError(req.body?.id, -32000, 'Unknown MCP session'))
+        }
 
         session.principal = auth.principal
         session.updatedAt = now()
@@ -213,14 +260,19 @@ function createMcpTransport({
         return res.json(response)
     }
 
-    function attach(app) {
-        app.post('/mcp', (req, res, next) => handleMessage(req, res).catch(next))
+    function attach(app, { jsonParser } = {}) {
+        const postMiddleware = jsonParser
+            ? [authMiddleware, jsonParser]
+            : [authMiddleware]
 
-        app.get('/mcp', (req, res) => {
-            const auth = authenticate(req)
-            if (!auth.ok) return rejectAuth(res, auth)
-            const session = getSession(req)
-            if (!session) return res.status(400).json({ error: 'Mcp-Session-Id header required' })
+        app.post('/mcp', authMiddleware, protocolMiddleware, ...(jsonParser ? [jsonParser] : []),
+            (req, res, next) => handleMessage(req, res).catch(next))
+
+        app.get('/mcp', authMiddleware, protocolMiddleware, (req, res) => {
+            const lookup = lookupSession(req)
+            if (!lookup.id) return res.status(400).json({ error: 'Mcp-Session-Id header required' })
+            if (!lookup.session) return res.status(404).json({ error: 'Unknown MCP session' })
+            const session = lookup.session
             beginSse(res)
             session.response = res
             session.transport = 'streamable-http'
@@ -230,19 +282,18 @@ function createMcpTransport({
             })
         })
 
-        app.delete('/mcp', (req, res) => {
-            const auth = authenticate(req)
-            if (!auth.ok) return rejectAuth(res, auth)
-            const session = getSession(req)
-            if (!session) return res.status(404).json({ error: 'Unknown MCP session' })
+        app.delete('/mcp', authMiddleware, protocolMiddleware, (req, res) => {
+            const lookup = lookupSession(req)
+            if (!lookup.id) return res.status(400).json({ error: 'Mcp-Session-Id header required' })
+            if (!lookup.session) return res.status(404).json({ error: 'Unknown MCP session' })
+            const session = lookup.session
             try { session.response?.end() } catch {}
             sessions.delete(session.id)
             res.status(204).end()
         })
 
-        app.get('/sse', (req, res) => {
-            const auth = authenticate(req)
-            if (!auth.ok) return rejectAuth(res, auth)
+        app.get('/sse', authMiddleware, (req, res) => {
+            const auth = req[MCP_AUTH]
             const session = createSession('2024-11-05', auth.principal)
             session.transport = 'legacy-sse'
             session.response = res
@@ -254,7 +305,8 @@ function createMcpTransport({
             })
         })
 
-        app.post('/messages', (req, res, next) => handleMessage(req, res, { legacy: true }).catch(next))
+        app.post('/messages', ...postMiddleware,
+            (req, res, next) => handleMessage(req, res, { legacy: true }).catch(next))
     }
 
     return { attach, dispatch, sessions, authenticate }
