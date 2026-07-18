@@ -1,5 +1,5 @@
 <script lang="ts">
-    import { AccessibilityIcon, ActivityIcon, PackageIcon, BotIcon, CodeIcon, CogIcon, ContactIcon, FlaskConicalIcon, ImageIcon, LanguagesIcon, MonitorIcon, MonitorSmartphoneIcon, Sailboat, ScrollTextIcon, SearchIcon, UserIcon, CircleXIcon, KeyboardIcon, TruckIcon, FileBoxIcon, Volume2Icon } from "@lucide/svelte";
+    import { AccessibilityIcon, ActivityIcon, PackageIcon, BotIcon, CodeIcon, CogIcon, ContactIcon, FlaskConicalIcon, ImageIcon, LanguagesIcon, MonitorIcon, MonitorSmartphoneIcon, Sailboat, ScrollTextIcon, SearchIcon, UserIcon, CircleXIcon, KeyboardIcon, TruckIcon, FileBoxIcon, Volume2Icon, WaypointsIcon } from "@lucide/svelte";
     import { language } from "src/lang";
     import DisplaySettings from "./Pages/DisplaySettings.svelte";
     import NotificationSoundSettings from "./Pages/NotificationSoundSettings.svelte";
@@ -26,6 +26,7 @@
     import HotkeySettings from "./Pages/HotkeySettings.svelte";
     import InlayImageGallery from "./Pages/InlayImageGallery.svelte";
     import RemoteAccessSettings from "./Pages/RemoteAccessSettings.svelte";
+    import McpSettings from "./Pages/McpSettings.svelte";
     import PluginDefinedIcon from "../Others/PluginDefinedIcon.svelte";
     import DevPanel from "src/lib/_dev/DevPanel.svelte";
     import SettingsSearch from "./SettingsSearch.svelte";
@@ -162,6 +163,15 @@
                     }}>
                         <CodeIcon />
                         <span>{language.plugin}</span>
+                    </button>
+                    <button class="flex gap-2 items-center hover:text-textcolor"
+                        class:text-textcolor={$SettingsMenuIndex === 24}
+                        class:text-textcolor2={$SettingsMenuIndex !== 24}
+                        onclick={() => {
+                        $SettingsMenuIndex = 24
+                    }}>
+                        <WaypointsIcon />
+                        <span>{language.mcp}</span>
                     </button>
                 {/if}
                 <button class="flex gap-2 items-center hover:text-textcolor"
@@ -301,6 +311,8 @@
                             <RemoteAccessSettings/>
                         {:else if $SettingsMenuIndex === 22}
                             <SystemSettings/>
+                        {:else if $SettingsMenuIndex === 24}
+                            <McpSettings/>
                         {:else if $SettingsMenuIndex === 99 && devPanelEnabled}
                             <DevPanel/>
                         {/if}

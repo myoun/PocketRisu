@@ -33,6 +33,9 @@ const {
 const { createRequestLogs } = require('./request-logs.cjs');
 const { applyPatch } = require('fast-json-patch');
 const { decodeRisuSave, encodeRisuSaveLegacy, calculateHash, normalizeJSON, normalizeForwardHeaders, hasRemoteBlocks } = require('./utils.cjs');
+const { createMcpConfigStore } = require('./mcpConfig.cjs');
+const { createMcpTokenStore } = require('./mcpTokens.cjs');
+const { createMcpTransport } = require('./mcpTransport.cjs');
 const { spawn, execSync } = require('child_process');
 const os = require('os');
 const { Readable, Transform } = require('stream');
@@ -781,6 +784,73 @@ const savePath = path.join(process.cwd(), "save")
 if(!existsSync(savePath)){
     mkdirSync(savePath)
 }
+const mcpTokenStore = createMcpTokenStore({
+    filePath: path.join(savePath, '__mcp_tokens'),
+})
+const mcpConfigStore = createMcpConfigStore({
+    filePath: path.join(savePath, '__mcp_config'),
+})
+const pocketRisuVersion = (() => {
+    try {
+        return JSON.parse(readFileSync(path.join(process.cwd(), 'package.json'), 'utf8')).version || '0.0.0'
+    } catch {
+        return '0.0.0'
+    }
+})()
+const externalMcpTransport = createMcpTransport({
+    configStore: mcpConfigStore,
+    tokenStore: mcpTokenStore,
+    serverName: 'PocketRisu',
+    serverVersion: pocketRisuVersion,
+    instructions: 'PocketRisu exposes a scoped self-hosted MCP interface. Read tools require risu.read; mutations require risu.write or risu.admin.',
+    tools: [
+        {
+            name: 'pocketrisu.get_status',
+            description: 'Return PocketRisu server status and MCP transport information.',
+            inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+            scope: 'risu.read',
+            handler: async () => ({
+                content: [{
+                    type: 'text',
+                    text: JSON.stringify({
+                        name: 'PocketRisu',
+                        version: pocketRisuVersion,
+                        transports: ['streamable-http', 'legacy-sse'],
+                    }, null, 2),
+                }],
+                structuredContent: {
+                    name: 'PocketRisu',
+                    version: pocketRisuVersion,
+                    transports: ['streamable-http', 'legacy-sse'],
+                },
+            }),
+        },
+        {
+            name: 'pocketrisu.list_characters',
+            description: 'List PocketRisu characters without chat message contents.',
+            inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+            scope: 'risu.read',
+            handler: async () => {
+                const raw = kvGet('database/database.bin')
+                if (!raw) {
+                    return { content: [{ type: 'text', text: '[]' }], structuredContent: { characters: [] } }
+                }
+                const db = await decodeDatabaseWithPersistentChatIds(raw)
+                const characters = (db.characters || []).map((character) => ({
+                    id: character.chaId || character.id || null,
+                    name: character.name || '',
+                    description: character.desc || character.description || '',
+                    chatCount: Array.isArray(character.chats) ? character.chats.length : 0,
+                }))
+                return {
+                    content: [{ type: 'text', text: JSON.stringify(characters, null, 2) }],
+                    structuredContent: { characters },
+                }
+            },
+        },
+    ],
+})
+externalMcpTransport.attach(app)
 
 // Server-side backup directory (outside save/ to avoid bloating updater copies).
 // Configurable at runtime via the kv key `config/server-backup-path`. When the
@@ -3041,6 +3111,71 @@ app.post('/api/session', async (req, res) => {
     const maxAge = 7 * 24 * 60 * 60 // seconds
     res.setHeader('Set-Cookie', `risu-session=${token}; HttpOnly; SameSite=Strict; Max-Age=${maxAge}; Path=/`)
     res.json({ ok: true })
+})
+
+// ── External MCP access tokens ──────────────────────────────────────────────
+// Management is deliberately authenticated with the normal PocketRisu login
+// JWT. Raw MCP tokens are returned once at creation and only their hashes are
+// persisted. The bearer-authenticated MCP transport can consume
+// mcpTokenStore.authenticate() when its tool surface is enabled.
+app.get('/api/mcp/config', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return
+    try {
+        res.json(mcpConfigStore.get())
+    } catch (error) {
+        next(error)
+    }
+})
+
+app.put('/api/mcp/config', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return
+    try {
+        res.json(mcpConfigStore.update(req.body))
+    } catch (error) {
+        if (error?.code === 'MCP_CONFIG_VALIDATION') {
+            return res.status(400).json({ error: error.message })
+        }
+        next(error)
+    }
+})
+
+app.get('/api/mcp/tokens', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return
+    try {
+        res.json({ tokens: mcpTokenStore.list() })
+    } catch (error) {
+        next(error)
+    }
+})
+
+app.post('/api/mcp/tokens', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return
+    try {
+        const created = mcpTokenStore.create({
+            name: req.body?.name,
+            scopes: req.body?.scopes,
+            expiresAt: req.body?.expiresAt ?? null,
+        })
+        res.status(201).json(created)
+    } catch (error) {
+        if (error?.code === 'MCP_TOKEN_VALIDATION') {
+            return res.status(400).json({ error: error.message })
+        }
+        next(error)
+    }
+})
+
+app.delete('/api/mcp/tokens/:id', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return
+    try {
+        const token = mcpTokenStore.revoke(req.params.id)
+        if (!token) {
+            return res.status(404).json({ error: 'MCP token not found' })
+        }
+        res.json({ token })
+    } catch (error) {
+        next(error)
+    }
 })
 
 // ── Direct asset serving (F-1) ─────────────────────────────────────────────
