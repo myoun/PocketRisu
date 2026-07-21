@@ -30,7 +30,8 @@ import {
     type AdapterCacheContext,
     type AdapterChatMessage, type AdapterChatOptions, type AdapterChatResponse,
     type AdapterChatStreamDelta, type AdapterCredential,
-    type AdapterToolCall, type AdapterToolDef, type AdapterUsage,
+    type AdapterReasoningPart, type AdapterToolCall, type AdapterToolDef,
+    type AdapterUsage, type ToolLoopEvent,
 } from "src/ts/preset/adapter";
 import { formatReasoningParts } from "src/ts/preset/adapter/reasoning";
 import { TOOL_CAPABLE_ADAPTER_KINDS, VISION_CAPABLE_ADAPTER_KINDS, type AdapterKind, type ModelPreset } from "src/ts/preset/types";
@@ -41,7 +42,7 @@ import { expandAdapterMessages, toAdapterMessage, toolResponseText } from "./mod
 import { isLocalNetworkUrl } from "src/ts/network/localNetwork";
 import { createRequestLogScope, type RequestLogRoute, type RequestLogSource, type RequestLogUsage } from "src/ts/requestLog";
 import {
-    startStatus, appendText, endStatus, setStatusTokenCounter, addBadge,
+    startStatus, appendText, endStatus, markPhase, setStatusTokenCounter, addBadge,
     type RequestKind,
 } from "src/ts/status/requestStatus";
 
@@ -689,6 +690,19 @@ function resolvePresetStreaming(preset: ModelPreset, arg: RequestDataArgumentExt
 // follow-up re-run already-executed (possibly write-side) tools.
 const MODEL_PRESET_MAX_TOOL_STEPS = 8
 
+type ModelPresetToolLoopOutcome = 'done' | 'partial' | 'aborted'
+
+function addAdapterUsage(total: AdapterUsage | undefined, next: AdapterUsage | undefined): AdapterUsage | undefined {
+    if (!next) return total
+    const merged: AdapterUsage = { ...(total ?? {}) }
+    const keys: (keyof AdapterUsage)[] = ['promptTokens', 'completionTokens', 'totalTokens', 'cachedTokens']
+    for (const key of keys) {
+        const value = next[key]
+        if (value !== undefined) merged[key] = (merged[key] ?? 0) + value
+    }
+    return merged
+}
+
 // How often (ms) a streaming response flushes accumulated text to the chat
 // renderer. Adapters yield one delta per token; each emitted chunk forces a full
 // re-parse of the whole message (markdown + sanitize) downstream, so emitting
@@ -927,12 +941,87 @@ async function requestModelPreset(arg:RequestDataArgumentExtended, preset:ModelP
     }
 
     try {
+        // One status entry represents the whole user generation, not one HTTP
+        // hop. Tool loops may send multiple model requests but keep this same id.
+        if (reportStatus) {
+            safeStatus(() => startStatus(genId, { kind: statusKind, label: preset.name, chatId: arg.realChatId, phase: 'connecting', now: Date.now() }))
+        }
+
         // Tool runs always go non-streaming for now: the execute→re-request loop
         // needs the full structured response (tool_calls) each turn, and
-        // streaming tool_call assembly is a later stage. Status is NOT reported
-        // for the tool path in v1 (it bypasses the pump); see the toast infra note.
+        // streaming tool_call assembly is a later stage. Lifecycle events from
+        // the loop update the same generation-level status entry.
         if (tools) {
-            const { result, toolsExecuted } = await runModelPresetToolLoop(arg, preset, kind, credential, fetchImpl, messages, tools, abortSignal)
+            const onToolLoopEvent = reportStatus ? (event: ToolLoopEvent) => safeStatus(() => {
+                const now = Date.now()
+                switch (event.type) {
+                    case 'model_start':
+                        markPhase(genId, 'connecting', now)
+                        break
+                    case 'model_end': {
+                        const thinking = event.response.reasoning
+                            ?.map((part) => part.text ?? '')
+                            .join('') ?? ''
+                        if (thinking) appendText(genId, { thinking }, now)
+                        if (event.response.text) appendText(genId, { response: event.response.text }, now)
+                        break
+                    }
+                    case 'tool_start':
+                        markPhase(genId, 'tooling', now)
+                        addBadge(genId, {
+                            key: 'tool',
+                            text: language.requestStatus.toolRunning.replace('{name}', event.call.name),
+                        })
+                        break
+                    case 'tool_end':
+                        addBadge(genId, {
+                            key: 'tool',
+                            text: (event.result.ok === false
+                                ? language.requestStatus.toolFailed
+                                : language.requestStatus.toolRunning
+                            ).replace('{name}', event.call.name),
+                            tone: event.result.ok === false ? 'warn' : 'success',
+                        })
+                        break
+                    case 'partial':
+                        addBadge(genId, {
+                            key: 'tool-partial',
+                            text: language.requestStatus.toolPartial,
+                            tone: 'warn',
+                        })
+                        break
+                }
+            }) : undefined
+            const loop = await runModelPresetToolLoop(
+                arg, preset, kind, credential, fetchImpl, messages, tools, abortSignal, onToolLoopEvent,
+            )
+            if (reportStatus) {
+                safeStatus(() => {
+                    if (loop.failedTools > 0) {
+                        addBadge(genId, {
+                            key: 'tool',
+                            text: language.requestStatus.toolsFailed.replace('{n}', loop.failedTools.toLocaleString()),
+                            tone: 'warn',
+                        })
+                    } else if (loop.toolCalls > 0) {
+                        addBadge(genId, {
+                            key: 'tool',
+                            text: language.requestStatus.toolsUsed.replace('{n}', loop.toolCalls.toLocaleString()),
+                            tone: 'success',
+                        })
+                    }
+                    const outcome = abortSignal?.aborted || loop.outcome === 'aborted'
+                        ? 'aborted'
+                        : loop.outcome
+                    endStatus(genId, outcome, {
+                        now: Date.now(),
+                        usage: loop.usage?.completionTokens !== undefined
+                            ? { responseTokens: loop.usage.completionTokens }
+                            : undefined,
+                    })
+                })
+            }
+            const { result, toolsExecuted } = loop
             // The tool loop issues one request per turn; each is its own log
             // entry and all of them flush together here.
             void logScope.close()
@@ -948,9 +1037,6 @@ async function requestModelPreset(arg:RequestDataArgumentExtended, preset:ModelP
             // Prompt-cache breakpoints ride on message.cachePoint; this only picks
             // the TTL, matching the classic Anthropic path.
             anthropicCache1h: getDatabase().claude1HourCaching === true,
-        }
-        if (reportStatus) {
-            safeStatus(() => startStatus(genId, { kind: statusKind, label: preset.name, chatId: arg.realChatId, phase: 'connecting', now: Date.now() }))
         }
         if(useStreaming){
             const gen = streamModelPreset(kind, preset, options, credential)
@@ -1096,10 +1182,24 @@ async function runModelPresetToolLoop(
     messages: AdapterChatMessage[],
     tools: AdapterToolDef[],
     abortSignal: AbortSignal | null,
-): Promise<{ result: string; toolsExecuted: boolean }> {
+    onEvent?: (event: ToolLoopEvent) => void,
+): Promise<{
+    result: string
+    toolsExecuted: boolean
+    outcome: ModelPresetToolLoopOutcome
+    usage?: AdapterUsage
+    modelCalls: number
+    toolCalls: number
+    failedTools: number
+}> {
     // Tracks whether any tool actually ran, so the caller can block outer
     // success-path retries that would otherwise re-execute side-effecting tools.
     let toolsExecuted = false
+    let outcome: ModelPresetToolLoopOutcome = 'done'
+    let usage: AdapterUsage | undefined
+    let modelCalls = 0
+    let toolCalls = 0
+    let failedTools = 0
     const result = await runToolLoop(messages, {
         maxSteps: MODEL_PRESET_MAX_TOOL_STEPS,
         formatReasoning: formatPresetReasoning,
@@ -1132,32 +1232,52 @@ async function runModelPresetToolLoop(
                     console.error('[ModelPreset] tool-call persistence failed', e)
                 }
             }
-            return { text: executed.text, encoded }
+            return { text: executed.text, encoded, ok: executed.ok }
+        },
+        onEvent: (event) => {
+            switch (event.type) {
+                case 'model_start':
+                    modelCalls++
+                    break
+                case 'model_end':
+                    usage = addAdapterUsage(usage, event.response.usage)
+                    break
+                case 'tool_start':
+                    toolCalls++
+                    break
+                case 'tool_end':
+                    if (event.result.ok === false) failedTools++
+                    break
+                case 'partial':
+                    outcome = event.reason === 'aborted' ? 'aborted' : 'partial'
+                    break
+            }
+            onEvent?.(event)
         },
     })
-    return { result, toolsExecuted }
+    return { result, toolsExecuted, outcome, usage, modelCalls, toolCalls, failedTools }
 }
 
 async function executeModelPresetTool(
     arg: RequestDataArgumentExtended,
     call: AdapterToolCall,
-): Promise<{ text: string, response: RPCToolCallContent[] }> {
+): Promise<{ text: string, response: RPCToolCallContent[], ok: boolean }> {
     const tool = (arg.tools ?? []).find(t => t.name === call.name)
     if (!tool) {
-        return { text: 'No tool found with name: ' + call.name, response: [] }
+        return { text: 'No tool found with name: ' + call.name, response: [], ok: false }
     }
     let parsedArgs: unknown
     try {
         parsedArgs = call.arguments ? JSON.parse(call.arguments) : {}
     } catch (e) {
-        return { text: 'Tool call has invalid JSON arguments: ' + (e instanceof Error ? e.message : String(e)), response: [] }
+        return { text: 'Tool call has invalid JSON arguments: ' + (e instanceof Error ? e.message : String(e)), response: [], ok: false }
     }
     try {
         const response = await callTool(call.name, parsedArgs)
         const text = toolResponseText(response)
-        return { text: text.length > 0 ? text : 'Tool call returned no text response', response }
+        return { text: text.length > 0 ? text : 'Tool call returned no text response', response, ok: true }
     } catch (e) {
-        return { text: 'Tool call failed: ' + (e instanceof Error ? e.message : String(e)), response: [] }
+        return { text: 'Tool call failed: ' + (e instanceof Error ? e.message : String(e)), response: [], ok: false }
     }
 }
 

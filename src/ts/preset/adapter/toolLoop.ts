@@ -13,7 +13,27 @@ import type {
 export interface ToolStepResult {
     text: string
     encoded?: string
+    // False means the tool returned an execution-level error as text. The loop
+    // still feeds that text back to the model, but observers can surface a
+    // warning without treating the whole generation as failed.
+    ok?: boolean
 }
+
+export type ToolLoopPartialReason =
+    | 'follow_up_failed'
+    | 'tool_execution_failed'
+    | 'max_steps'
+    | 'aborted'
+
+// Lifecycle events describe orchestration, not UI. A caller may translate them
+// into a status toast, logs, telemetry, or nothing at all. Observer failures are
+// isolated so instrumentation can never break or replay a tool run.
+export type ToolLoopEvent =
+    | { type: 'model_start', step: number }
+    | { type: 'model_end', step: number, response: AdapterChatResponse }
+    | { type: 'tool_start', step: number, call: AdapterToolCall }
+    | { type: 'tool_end', step: number, call: AdapterToolCall, result: ToolStepResult }
+    | { type: 'partial', step: number, reason: ToolLoopPartialReason, error?: unknown }
 
 export interface ToolLoopDeps {
     // Send the current conversation and return the model's structured response.
@@ -32,6 +52,15 @@ export interface ToolLoopDeps {
     // Checked before EACH tool call so a parallel batch doesn't keep firing
     // write-side tools after an abort. (send() already honors abort via fetch.)
     abortSignal?: AbortSignal
+    onEvent?: (event: ToolLoopEvent) => void
+}
+
+function emit(deps: ToolLoopDeps, event: ToolLoopEvent): void {
+    try {
+        deps.onEvent?.(event)
+    } catch {
+        // Status/log observers are non-critical and must never affect tools.
+    }
 }
 
 // Drives the tool-use loop: send → if the model requested tools, execute them and
@@ -52,6 +81,7 @@ export async function runToolLoop(
     for (let step = 0; ; step++) {
         let response: AdapterChatResponse
         try {
+            emit(deps, { type: 'model_start', step })
             response = await deps.send(convo)
         } catch (err) {
             // A failure AFTER tools already ran must not bubble to the outer
@@ -61,9 +91,11 @@ export async function runToolLoop(
             // on the first send (nothing executed yet) is safe to surface for
             // normal retry/fallback.
             if (!executedAny) throw err
+            emit(deps, { type: 'partial', step, reason: 'follow_up_failed', error: err })
             parts.push('[ModelPreset: follow-up request failed after tool execution]')
             return joinParts(parts)
         }
+        emit(deps, { type: 'model_end', step, response })
         // Prepend this turn's reasoning (for display) to its text segment, matching
         // the classic path where <Thoughts> precede the visible reply.
         const head = deps.formatReasoning?.(response.reasoning) ?? ''
@@ -72,6 +104,7 @@ export async function runToolLoop(
         const calls = response.toolCalls ?? []
         if (calls.length === 0) break
         if (step >= deps.maxSteps) {
+            emit(deps, { type: 'partial', step, reason: 'max_steps' })
             parts.push(`[ModelPreset: maximum tool steps (${deps.maxSteps}) reached]`)
             break
         }
@@ -85,6 +118,7 @@ export async function runToolLoop(
             // If any tool already ran, return partial so the outer retry loop
             // (guarded by toolExecuted) won't replay the prompt and re-run them.
             if (deps.abortSignal?.aborted) {
+                emit(deps, { type: 'partial', step, reason: 'aborted' })
                 parts.push('[ModelPreset: aborted before completing tool calls]')
                 return joinParts(parts)
             }
@@ -93,13 +127,16 @@ export async function runToolLoop(
             // persistence write — must not bubble to the outer retry loop, or it
             // would replay the prompt and re-run already-executed tools.
             executedAny = true
+            emit(deps, { type: 'tool_start', step, call })
             let result: ToolStepResult
             try {
                 result = await deps.executeTool(call)
-            } catch {
+            } catch (error) {
+                emit(deps, { type: 'partial', step, reason: 'tool_execution_failed', error })
                 parts.push('[ModelPreset: tool execution failed]')
                 return joinParts(parts)
             }
+            emit(deps, { type: 'tool_end', step, call, result })
             convo.push({ role: 'tool', content: result.text, toolCallId: call.id, name: call.name })
             if (result.encoded) parts.push(result.encoded.trim())
         }

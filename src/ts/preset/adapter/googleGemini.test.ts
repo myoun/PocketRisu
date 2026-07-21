@@ -256,6 +256,11 @@ describe('sendGoogleChatRequest (non-stream)', () => {
         expect(calls[0].body.tools).toEqual([
             { functionDeclarations: [{ name: 'a', description: 'A', parameters: { type: 'object' } }] },
         ])
+        expect(calls[0].body.toolConfig).toEqual({
+            functionCallingConfig: {
+                mode: 'VALIDATED',
+            },
+        })
     })
 
     test('parses functionCall (with thoughtSignature) and thought parts from response', async () => {
@@ -282,6 +287,108 @@ describe('sendGoogleChatRequest (non-stream)', () => {
         // separately below).
         expect(result.toolCalls).toMatchObject([{ name: 'search', arguments: '{"q":"x"}', signature: 'FS' }])
         expect(result.reasoning).toEqual([{ text: 'reasoning', signature: 'TS' }])
+    })
+
+    test.each(['MALFORMED_FUNCTION_CALL', 'UNEXPECTED_TOOL_CALL'])(
+        'treats %s as a retryable parse failure when tools are enabled',
+        async (finishReason) => {
+            const { fetchImpl } = captureFetch(
+                jsonResponse({
+                    candidates: [{
+                        content: { parts: [] },
+                        finishReason,
+                        finishMessage: 'The generated call did not match the declaration.',
+                    }],
+                }),
+            )
+            await expect(
+                sendGoogleChatRequest(
+                    makePreset(),
+                    {
+                        messages: [{ role: 'user', content: 'use the tool' }],
+                        tools: [{ name: 'search', parameters: { type: 'object' } }],
+                        fetchImpl,
+                    },
+                    { apiKey: 'k' },
+                ),
+            ).rejects.toMatchObject({
+                kind: 'parse',
+                retryable: true,
+                message: expect.stringContaining(finishReason),
+            })
+        },
+    )
+
+    test('treats an empty STOP candidate as retryable when tools are enabled', async () => {
+        const { fetchImpl } = captureFetch(
+            jsonResponse({
+                candidates: [{
+                    content: { parts: [] },
+                    finishReason: 'STOP',
+                }],
+            }),
+        )
+        await expect(
+            sendGoogleChatRequest(
+                makePreset(),
+                {
+                    messages: [{ role: 'user', content: 'use the tool' }],
+                    tools: [{ name: 'search', parameters: { type: 'object' } }],
+                    fetchImpl,
+                },
+                { apiKey: 'k' },
+            ),
+        ).rejects.toMatchObject({
+            kind: 'parse',
+            retryable: true,
+            message: 'Gemini returned no text or tool calls (finishReason: STOP)',
+        })
+    })
+
+    test('classifies a policy-blocked empty tool response as invalid-request', async () => {
+        const { fetchImpl } = captureFetch(
+            jsonResponse({
+                candidates: [{
+                    content: { parts: [] },
+                    finishReason: 'SAFETY',
+                    finishMessage: 'Response blocked by safety policy.',
+                }],
+            }),
+        )
+        await expect(
+            sendGoogleChatRequest(
+                makePreset(),
+                {
+                    messages: [{ role: 'user', content: 'use the tool' }],
+                    tools: [{ name: 'search', parameters: { type: 'object' } }],
+                    fetchImpl,
+                },
+                { apiKey: 'k' },
+            ),
+        ).rejects.toMatchObject({
+            kind: 'invalid-request',
+            retryable: false,
+            fallbackEligible: false,
+            message: expect.stringContaining('SAFETY'),
+        })
+    })
+
+    test('preserves legacy empty-response behavior when tools are disabled', async () => {
+        const { fetchImpl } = captureFetch(
+            jsonResponse({
+                candidates: [{
+                    content: { parts: [] },
+                    finishReason: 'STOP',
+                }],
+            }),
+        )
+        const result = await sendGoogleChatRequest(
+            makePreset(),
+            { messages: [{ role: 'user', content: 'say nothing' }], fetchImpl },
+            { apiKey: 'k' },
+        )
+        expect(result.text).toBe('')
+        expect(result.finishReason).toBe('STOP')
     })
 
     test('leaves call id empty when Gemini omits one (KV uniqueness handled downstream)', async () => {
@@ -338,6 +445,37 @@ describe('sendGoogleChatRequest (non-stream)', () => {
         await sendGoogleChatRequest(preset, { messages: [{ role: 'user', content: 'q' }], fetchImpl }, { apiKey: 'k' })
         expect(calls[0].body.tools).toBeUndefined()
         expect(calls[0].body.toolConfig).toBeUndefined()
+    })
+
+    test('preserves customBody.toolConfig when tools are enabled', async () => {
+        const preset = makePreset({
+            customBody: {
+                toolConfig: {
+                    functionCallingConfig: {
+                        mode: 'ANY',
+                        allowedFunctionNames: ['a'],
+                    },
+                },
+            },
+        })
+        const { fetchImpl, calls } = captureFetch(
+            jsonResponse({ candidates: [{ content: { parts: [{ text: 'ok' }] } }] }),
+        )
+        await sendGoogleChatRequest(
+            preset,
+            {
+                messages: [{ role: 'user', content: 'q' }],
+                tools: [{ name: 'a', parameters: {} }],
+                fetchImpl,
+            },
+            { apiKey: 'k' },
+        )
+        expect(calls[0].body.toolConfig).toEqual({
+            functionCallingConfig: {
+                mode: 'ANY',
+                allowedFunctionNames: ['a'],
+            },
+        })
     })
 
     test('resends model parts verbatim via providerEcho (preserves text-part thoughtSignature)', async () => {

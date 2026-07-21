@@ -120,7 +120,7 @@ export async function sendGoogleChatRequest(
         })
     }
 
-    const parsed = parseGeminiResponse(raw)
+    const parsed = parseGeminiResponse(raw, (options.tools?.length ?? 0) > 0)
     // Fire-and-forget cache lifecycle (create/extend/cleanup) off the observed
     // usage; never blocks or fails the response.
     cacheTurn?.finish(parsed.usage?.promptTokens)
@@ -239,6 +239,13 @@ async function prepareGeminiBody(
     }
     if (options.tools && options.tools.length > 0) {
         prepared.body.tools = [{ functionDeclarations: options.tools.map(toGeminiFunctionDeclaration) }]
+        if (prepared.body.toolConfig === undefined) {
+            prepared.body.toolConfig = {
+                functionCallingConfig: {
+                    mode: 'VALIDATED',
+                },
+            }
+        }
     } else {
         // Tools are gated by the request, not customBody / additionalParams:
         // strip the whole tool-control surface when off so the OFF toggle is a
@@ -404,8 +411,22 @@ async function deriveHttpError(response: Response): Promise<ModelPresetAdapterEr
         ?? new ModelPresetAdapterError('unknown', message, { status: response.status })
 }
 
+const GEMINI_TOOL_FAILURE_FINISH_REASONS = new Set([
+    'MALFORMED_FUNCTION_CALL',
+    'UNEXPECTED_TOOL_CALL',
+])
+
+const GEMINI_BLOCKED_FINISH_REASONS = new Set([
+    'SAFETY',
+    'RECITATION',
+    'BLOCKLIST',
+    'PROHIBITED_CONTENT',
+    'SPII',
+    'MODEL_ARMOR',
+])
+
 // Exported (pure) for job-journal recovery replay (process/request/jobRecovery.ts).
-export function parseGeminiResponse(raw: unknown): AdapterChatResponse {
+export function parseGeminiResponse(raw: unknown, toolsEnabled = false): AdapterChatResponse {
     if (!isPlainObject(raw)) {
         throw new ModelPresetAdapterError('parse', 'Gemini response is not an object')
     }
@@ -426,6 +447,12 @@ export function parseGeminiResponse(raw: unknown): AdapterChatResponse {
     const finishReason = typeof first['finishReason'] === 'string'
         ? (first['finishReason'] as string)
         : undefined
+    const finishMessage = typeof first['finishMessage'] === 'string'
+        ? (first['finishMessage'] as string)
+        : undefined
+    if (toolsEnabled) {
+        validateGeminiToolResponse(parsed, finishReason, finishMessage)
+    }
     const echoParts = isPlainObject(first['content']) && Array.isArray((first['content'] as Record<string, unknown>)['parts'])
         ? (first['content'] as Record<string, unknown>)['parts']
         : undefined
@@ -441,6 +468,44 @@ export function parseGeminiResponse(raw: unknown): AdapterChatResponse {
         usage: parseGeminiUsage(raw['usageMetadata']),
         raw,
     }
+}
+
+function validateGeminiToolResponse(
+    parsed: ReturnType<typeof parseGeminiParts>,
+    finishReason?: string,
+    finishMessage?: string,
+): void {
+    const finishDetail = finishMessage ? `${finishReason ?? 'UNKNOWN'}: ${finishMessage}` : (finishReason ?? 'UNKNOWN')
+
+    // Gemini can return HTTP 200 with no usable functionCall when generation of
+    // the structured call failed. Treat that as a retryable parse failure while
+    // no tool has run; request.ts's existing retry loop can safely try again.
+    if (finishReason && GEMINI_TOOL_FAILURE_FINISH_REASONS.has(finishReason)) {
+        throw new ModelPresetAdapterError(
+            'parse',
+            `Gemini failed to generate a valid tool call (${finishDetail})`,
+        )
+    }
+
+    if (parsed.text.length > 0 || parsed.toolCalls.length > 0) return
+
+    // Policy-filtered candidates are request failures rather than malformed
+    // structured output. Preserve that distinction and surface the provider
+    // reason instead of returning an empty success.
+    if (finishReason && GEMINI_BLOCKED_FINISH_REASONS.has(finishReason)) {
+        throw new ModelPresetAdapterError(
+            'invalid-request',
+            `Gemini blocked the tool response (${finishDetail})`,
+            { retryable: false, fallbackEligible: false },
+        )
+    }
+
+    // Reasoning-only or otherwise empty candidates are not actionable in a
+    // tool-enabled turn. Returning them as success creates an empty chat bubble.
+    throw new ModelPresetAdapterError(
+        'parse',
+        `Gemini returned no text or tool calls (finishReason: ${finishDetail})`,
+    )
 }
 
 // Split a Gemini candidate's content into visible text, tool calls, and reasoning

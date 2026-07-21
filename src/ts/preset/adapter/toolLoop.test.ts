@@ -1,5 +1,5 @@
 import { describe, expect, test, vi } from 'vitest'
-import { runToolLoop, type ToolLoopDeps } from './toolLoop'
+import { runToolLoop, type ToolLoopDeps, type ToolLoopEvent } from './toolLoop'
 import type { AdapterChatMessage, AdapterChatResponse, AdapterToolCall } from './types'
 
 const NL2 = String.fromCharCode(10, 10) // blank-line separator the loop joins with
@@ -58,6 +58,42 @@ describe('runToolLoop', () => {
         expect(secondConvo).toHaveLength(3)
         expect(secondConvo[1]).toMatchObject({ role: 'assistant', toolCalls: [{ id: 'c1', name: 'search' }] })
         expect(secondConvo[2]).toMatchObject({ role: 'tool', toolCallId: 'c1', name: 'search', content: 'result for search' })
+    })
+
+    test('emits one ordered lifecycle across model and tool hops', async () => {
+        const { send } = scriptedSend([
+            { ...res('', [call('c1', 'search')]), usage: { promptTokens: 10, completionTokens: 2 } },
+            { ...res('done'), usage: { promptTokens: 20, completionTokens: 3 } },
+        ])
+        const events: ToolLoopEvent[] = []
+        await runToolLoop(initial, {
+            send,
+            executeTool: async () => ({ text: 'result', ok: true }),
+            maxSteps: 8,
+            onEvent: (event) => events.push(event),
+        })
+        expect(events.map((event) => event.type)).toEqual([
+            'model_start', 'model_end', 'tool_start', 'tool_end',
+            'model_start', 'model_end',
+        ])
+        expect(events[2]).toMatchObject({ type: 'tool_start', step: 0, call: { name: 'search' } })
+        expect(events[5]).toMatchObject({ type: 'model_end', step: 1 })
+    })
+
+    test('isolates a throwing lifecycle observer from tool execution', async () => {
+        const { send } = scriptedSend([
+            res('', [call('c1', 'search')]),
+            res('done'),
+        ])
+        const executeTool = vi.fn(async () => ({ text: 'result' }))
+        const out = await runToolLoop(initial, {
+            send,
+            executeTool,
+            maxSteps: 8,
+            onEvent: () => { throw new Error('observer failed') },
+        })
+        expect(out).toBe('done')
+        expect(executeTool).toHaveBeenCalledTimes(1)
     })
 
     test('handles parallel tool calls in a single step (ordered results)', async () => {
@@ -126,10 +162,16 @@ describe('runToolLoop', () => {
         const send = vi.fn()
             .mockResolvedValueOnce(res('first', [call('c1', 'x')]))
             .mockRejectedValueOnce(new Error('network down'))
-        const out = await runToolLoop(initial, { send, executeTool, maxSteps: 8 })
+        const events: ToolLoopEvent[] = []
+        const out = await runToolLoop(initial, { send, executeTool, maxSteps: 8, onEvent: (event) => events.push(event) })
         expect(out).toContain('first')
         expect(out).toContain('follow-up request failed')
         expect(executeTool).toHaveBeenCalledTimes(1) // ran once, not re-run
+        expect(events).toContainEqual(expect.objectContaining({
+            type: 'partial',
+            reason: 'follow_up_failed',
+            step: 1,
+        }))
     })
 
     test('returns partial (no throw) when executeTool fails after a side effect', async () => {

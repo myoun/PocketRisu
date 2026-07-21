@@ -43,4 +43,9 @@ export { sendAnthropicChatRequest, streamAnthropicChatRequest, previewAnthropicC
 export { sendGoogleChatRequest, streamGoogleChatRequest, previewGoogleChatRequest } from './googleGemini'
 export { sendCodexResponsesRequest, streamCodexResponsesRequest, previewCodexResponsesRequest } from './codexResponses'
 export { runToolLoop } from './toolLoop'
-export type { ToolLoopDeps, ToolStepResult } from './toolLoop'
+export type {
+    ToolLoopDeps,
+    ToolLoopEvent,
+    ToolLoopPartialReason,
+    ToolStepResult,
+} from './toolLoop'

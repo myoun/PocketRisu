@@ -126,9 +126,11 @@ describe('recomputeEntry', () => {
 describe('isTerminalPhase', () => {
     it('classifies terminal vs live', () => {
         expect(isTerminalPhase('done')).toBe(true)
+        expect(isTerminalPhase('partial')).toBe(true)
         expect(isTerminalPhase('failed')).toBe(true)
         expect(isTerminalPhase('aborted')).toBe(true)
         expect(isTerminalPhase('connecting')).toBe(false)
+        expect(isTerminalPhase('tooling')).toBe(false)
         expect(isTerminalPhase('stalled')).toBe(false)
     })
 })
@@ -208,6 +210,18 @@ describe('publish API', () => {
         expect(e.phase).toBe('done')
         expect(e.responseTokens).toBe(999)
         expect(e.thinkingTokens).toBe(3)
+    })
+
+    it('supports tooling as live and partial as terminal', () => {
+        startStatus('g1', { kind: 'main', label: 'x', now: 0 })
+        markPhase('g1', 'tooling', 10)
+        expect(get(requestStatuses).get('g1')!.phase).toBe('tooling')
+        endStatus('g1', 'partial', { now: 20, usage: { responseTokens: 7 } })
+        const e = get(requestStatuses).get('g1')!
+        expect(e.phase).toBe('partial')
+        expect(e.responseTokens).toBe(7)
+        markPhase('g1', 'connecting', 30)
+        expect(get(requestStatuses).get('g1')!.phase).toBe('partial')
     })
 
     it('markPhase does not regress out of a terminal phase', () => {

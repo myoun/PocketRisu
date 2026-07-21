@@ -30,10 +30,12 @@
         connecting: rs?.connecting ?? 'Connecting…',
         thinking:   rs?.thinking ?? 'Thinking…',
         responding: rs?.responding ?? 'Responding…',
+        tooling:    rs?.tooling ?? 'Using tool…',
         retrying:   rs?.retrying ?? 'Retrying…',
         stalled:    rs?.stalled ?? 'Stalled…',
         background: rs?.background ?? 'In background…',
         done:       rs?.done ?? 'Done',
+        partial:    rs?.partial ?? 'Partially completed',
         failed:     rs?.failed ?? 'Failed',
         aborted:    rs?.aborted ?? 'Cancelled',
     }
@@ -48,12 +50,14 @@
     // Accent bar / phase text color by phase.
     function accentClass(phase: RequestPhase): string {
         if (phase === 'done') return 'rs-accent-success'
+        if (phase === 'partial') return 'rs-accent-warn'
         if (phase === 'failed') return 'rs-accent-danger'
         if (phase === 'stalled' || phase === 'aborted') return 'rs-accent-muted'
         return 'rs-accent-primary'
     }
     function phaseColor(phase: RequestPhase): string {
         if (phase === 'done') return 'text-success'
+        if (phase === 'partial') return 'rs-text-warn'
         if (phase === 'failed') return 'text-draculared'
         if (phase === 'stalled' || phase === 'aborted') return 'text-textcolor2'
         return 'text-primary'
@@ -100,6 +104,7 @@
         <div class="rs-body">
             <div class="rs-row1">
                 <span class="rs-dot" class:rs-dot-success={entry.phase === 'done'}
+                      class:rs-dot-warn={entry.phase === 'partial'}
                       class:rs-dot-danger={entry.phase === 'failed'}
                       class:rs-dot-muted={entry.phase === 'stalled' || entry.phase === 'aborted'}
                       class:rs-breathe={spinning}></span>
@@ -152,6 +157,7 @@
     .rs-card { border-left-width: 4px; }
     .rs-accent-primary { border-left-color: var(--risu-theme-primary); }
     .rs-accent-success { border-left-color: var(--risu-theme-success); }
+    .rs-accent-warn    { border-left-color: #facc15; }
     .rs-accent-danger  { border-left-color: var(--risu-theme-draculared); }
     .rs-accent-muted   { border-left-color: var(--risu-theme-textcolor2); }
 
@@ -161,6 +167,7 @@
     .rs-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
         background: var(--risu-theme-primary); }
     .rs-dot-success { background: var(--risu-theme-success); }
+    .rs-dot-warn    { background: #facc15; }
     .rs-dot-danger  { background: var(--risu-theme-draculared); }
     .rs-dot-muted   { background: var(--risu-theme-textcolor2); }
     .rs-breathe { animation: rs-breathe 1.5s ease-in-out infinite; }
@@ -172,6 +179,7 @@
     @keyframes rs-spin { to { transform: rotate(360deg); } }
 
     .rs-phase { font-weight: 600; }
+    .rs-text-warn { color: #facc15; }
     .rs-chip {
         font-size: 11px; padding: 1px 7px; border-radius: 999px; flex-shrink: 0;
         background: var(--risu-theme-selected); color: var(--risu-theme-textcolor);
