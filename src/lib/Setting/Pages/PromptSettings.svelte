@@ -5,6 +5,7 @@
     import PromptDataItem from "src/lib/UI/PromptDataItem.svelte";
     import { tokenizePreset, type PromptItem } from "src/ts/process/prompt";
     import { templateCheck } from "src/ts/process/templates/templateCheck";
+    import { deepTouch } from "src/ts/gui/deepTouch.svelte";
     
     import { DBState } from 'src/ts/stores.svelte';
     import Check from "src/lib/UI/GUI/CheckInput.svelte";
@@ -26,7 +27,9 @@
     let draggedIndex = $state(-1)
     let dragOverIndex = $state(-1)
     let openedItemIndices = $state(new Set<number>())
-    executeTokenize(DBState.db.promptTemplate)
+    let tokenizeTimer: ReturnType<typeof setTimeout> | undefined
+    let tokenizeRevision = 0
+    let tokenizeInitialized = false
   interface Props {
     onGoBack?: () => void;
     mode?: 'independent'|'inline';
@@ -35,17 +38,37 @@
 
   let { onGoBack = () => {}, mode = 'independent', subMenu = $bindable(0) }: Props = $props();
 
-    async function executeTokenize(prest: PromptItem[]){
-        tokens = await tokenizePreset(prest, true)
-        extokens = await tokenizePreset(prest, false)
+    async function executeTokenize(prest: PromptItem[], revision: number) {
+        const nextTokens = await tokenizePreset(prest, true)
+        const nextExactTokens = await tokenizePreset(prest, false)
+        if (revision !== tokenizeRevision) return
+        tokens = nextTokens
+        extokens = nextExactTokens
+    }
+
+    function scheduleTokenize() {
+        const revision = ++tokenizeRevision
+        clearTimeout(tokenizeTimer)
+        tokenizeTimer = setTimeout(() => {
+            const preset = $state.snapshot(DBState.db.promptTemplate) as PromptItem[]
+            void executeTokenize(preset, revision)
+        }, 300)
     }
 
     $effect.pre(() => {
-    warns = templateCheck(DBState.db)
-  });
-  $effect.pre(() => {
-    executeTokenize(DBState.db.promptTemplate)
-  });
+        warns = templateCheck(DBState.db)
+    });
+    $effect.pre(() => {
+        deepTouch(DBState.db.promptTemplate)
+        if (!tokenizeInitialized) {
+            tokenizeInitialized = true
+            const revision = ++tokenizeRevision
+            const preset = $state.snapshot(DBState.db.promptTemplate) as PromptItem[]
+            void executeTokenize(preset, revision)
+            return
+        }
+        scheduleTokenize()
+    });
 
   function getDisplayTemplate() {
     return DBState.db.promptTemplate.map((item, i) => ({
@@ -124,6 +147,8 @@
 
   onDestroy(() => {
     document.removeEventListener('keydown', handleKeyDown)
+    clearTimeout(tokenizeTimer)
+    tokenizeRevision++
   })
 </script>
 {#if mode === 'independent'}
