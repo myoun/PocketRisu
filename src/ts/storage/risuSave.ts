@@ -3,6 +3,7 @@ import * as fflate from "fflate";
 import { createBotPresetTemplate, getDatabase, type Database } from "./database.svelte";
 import { forageStorage } from "../globalApi.svelte";
 import { chatToStub } from "./chatStorage";
+import type { Operation } from "fast-json-patch";
 
 const packr = new Packr({
     useRecords:false
@@ -117,6 +118,9 @@ export class RisuSaveEncoder {
     // In-memory only (rebuilt by init()), so the representation is free to
     // differ from the patcher's protocol-level calculateHash.
     private characterJsons: { [key: string]: string } = {};
+    // Character ordering is the only global character invariant needed on a
+    // normal save. Content changes are supplied explicitly via toSave.character.
+    private characterIds: string[] = [];
 
     async init(data:Database,arg:{
         compression?: boolean,
@@ -168,6 +172,7 @@ export class RisuSaveEncoder {
             name: 'pluginStorage'
         });
         this.characterJsons = {}
+        this.characterIds = data.characters.map(character => character?.chaId)
         for( const character of data.characters) {
             // Replace chats with stubs for database.bin — full chat data lives server-side
             const charForEncode = { ...character, chats: character.chats.map(c => chatToStub(c)) }
@@ -196,7 +201,7 @@ export class RisuSaveEncoder {
         })
     }
 
-    async set(data:Database, toSave:toSaveType){
+    async set(data:Database, toSave:toSaveType, options: { verifyAllCharacters?: boolean } = {}){
         let obj:Record<any,any> = {}
         let keys = Object.keys(data)
         for(const key of keys){
@@ -208,59 +213,51 @@ export class RisuSaveEncoder {
             }
         }
 
-        const savedId = new Set<string>();
-        for(const character of data.characters) {
-            if (!character?.chaId) {
-                continue
-            }
-            const chaId = character.chaId
-            savedId.add(chaId)
-            const index = toSave.character.indexOf(chaId);
-            // Compare against the stub-replaced character so hydration (stub →
-            // full chat) doesn't read as a change of the character itself.
-            // Raw stringify (see init): circular refs fail the save loudly.
+        const currentCharacterIds = data.characters.map(character => character?.chaId)
+        const structuralChange =
+            currentCharacterIds.length !== this.characterIds.length ||
+            currentCharacterIds.some((id, index) => id !== this.characterIds[index])
+        const dirtyCharacterIds = new Set(toSave.character)
+        const charactersToCheck = structuralChange || options.verifyAllCharacters
+            ? data.characters
+            : data.characters.filter(character => dirtyCharacterIds.has(character?.chaId))
+        const savedIds = new Set(currentCharacterIds)
+
+        // Active character mutations are registered in changeTracker before
+        // this method runs. Avoid serializing every character merely to prove
+        // that the untracked characters are still unchanged.
+        for (const character of charactersToCheck) {
+            if (!character?.chaId) continue
             const charForEncode = { ...character, chats: character.chats.map(c => chatToStub(c)) }
             const charJson = JSON.stringify(charForEncode)
-            const hasChanged = this.characterJsons[chaId] !== charJson
-
-            if (index !== -1 || hasChanged || !this.blocks[chaId]) {
-                this.blocks[character.chaId] = await this.encodeBlock({
-                    compression: this.compression,
-                    data: charJson,
-                    type: RisuSaveType.CHARACTER_WITH_CHAT,
-                    name: character.chaId
-                }, {
-                    remote: 'prefer'
-                });
-                this.characterJsons[chaId] = charJson
-                if (index !== -1) {
-                    toSave.character.splice(index, 1);
-                }
+            if (this.characterJsons[character.chaId] === charJson && this.blocks[character.chaId]) {
+                continue
             }
-        }
-        if(toSave.character.length > 0){
-            console.log(`Deleting character data: ${toSave.character.join(', ')}`);
-            //probably deleted characters
-            for(const chaId of toSave.character){
-                if(!savedId.has(chaId)){
-                    delete this.blocks[chaId];
-                    delete this.characterJsons[chaId];
-                }
-            }
+            this.blocks[character.chaId] = await this.encodeBlock({
+                compression: this.compression,
+                data: charJson,
+                type: RisuSaveType.CHARACTER_WITH_CHAT,
+                name: character.chaId
+            }, {
+                remote: 'prefer'
+            });
+            this.characterJsons[character.chaId] = charJson
         }
 
-        // Ensure stale character blocks are always removed even when deletion wasn't tracked in toSave.
-        // This prevents deleted characters from being resurrected after full-write fallback.
-        const currentCharacterIds = new Set<string>((data.characters ?? []).map((character) => character?.chaId).filter(Boolean));
-        for (const key of Object.keys(this.blocks)) {
-            if (key === 'root' || key === 'preset' || key === 'modules' || key === 'config'
-                || key === 'plugins' || key === 'pluginStorage') {
-                continue;
+        if (structuralChange) {
+            for (const key of Object.keys(this.blocks)) {
+                if (
+                    key === 'root' || key === 'preset' || key === 'modules' || key === 'config' ||
+                    key === 'plugins' || key === 'pluginStorage'
+                ) {
+                    continue
+                }
+                if (!savedIds.has(key)) {
+                    delete this.blocks[key]
+                    delete this.characterJsons[key]
+                }
             }
-            if (!currentCharacterIds.has(key)) {
-                delete this.blocks[key];
-                delete this.characterJsons[key];
-            }
+            this.characterIds = currentCharacterIds
         }
 
         if(toSave.botPreset){
@@ -836,20 +833,21 @@ export function diffArrayWithIdGuard(
     }
     return ops
 }
+export interface RisuSavePatchResult {
+    patch: Operation[]
+    expectedHash: string
+    changedCharacterIds: string[]
+}
+
 
 export class RisuSavePatcher {
     private lastSyncedDb: any;
     private hashBlocks: { [key: string]: number } = {};
-    // Cheap change pre-check baselines. calculateHash over normalizeJSON'd data
-    // is the client↔server patch protocol (the server recomputes the same hash,
-    // see server.cjs expectedHash verification) and MUST NOT change — but when
-    // an entry's JSON is byte-identical to the baseline, the stored hash and
-    // baseline are still valid, so the expensive normalize+hash+diff can be
-    // skipped wholesale. String comparison is a native memcmp (~3x cheaper).
-    // Granularity matters: while typing into a root field (personaPrompt) or a
-    // module lorebook, that whole block changes on EVERY save — so baselines
-    // are kept per ROOT KEY and per MODULE, and only the changed entry pays
-    // normalize + protocol hash + diff.
+    // Cheap root and module pre-check baselines. calculateHash over
+    // normalizeJSON'd data is the client↔server patch protocol (the server
+    // recomputes the same hash, see server.cjs expectedHash verification) and
+    // MUST NOT change. Per-key and per-module JSON baselines let unchanged
+    // values skip normalize + protocol hash + diff.
     // Maps (not plain objects): ids come from user-importable data, so a key
     // like "__proto__" on a plain object would silently hit the prototype
     // setter instead of storing — corrupting the skip checks and, worse, the
@@ -924,10 +922,11 @@ export class RisuSavePatcher {
         }
     }
 
-    async set(data: any, toSave: toSaveType): Promise<{ patch: any[]; expectedHash: string }> {
+    async set(data: any, toSave: toSaveType): Promise<RisuSavePatchResult> {
         const { compare } = await import('fast-json-patch')
         const expectedHash: string = this.hash();
-        const patch: any[] = []
+        const patch: Operation[] = []
+        const changedCharacterIds = new Set<string>()
 
         const {
             characters: lastCharacters = [],
@@ -1107,50 +1106,60 @@ export class RisuSavePatcher {
                 }
             }
             this.lastSyncedDb.characters = normChars;
-            // Rebuild the cheap baselines from the NORMALIZED chars (the server's
-            // state), not the raw input — see init().
             this.lastCharJsons = new Map();
             for (const char of normChars) {
                 if (char?.chaId) this.lastCharJsons.set(char.chaId, JSON.stringify(char))
             }
         } else {
-            // Same structure → per-character field-level diff (efficient)
+            // Keep the safety net for mutations that missed changeTracker, but
+            // cooperatively yield between characters so a large DB cannot
+            // monopolize the UI thread. Tracked characters skip the raw JSON
+            // pre-check because they must take the authoritative diff path.
+            let scanSliceStarted = performance.now()
             for (let i = 0; i < curCharacters.length; i++) {
                 const lastChar = lastCharacters[i]
                 const curChar = curCharacters[i]
-                const curCharId = curChar?.chaId
-                const trackedBySave = toSave.character.includes(curCharId ?? '')
+                const characterId = curChar?.chaId
+                const trackedBySave = toSave.character.includes(characterId ?? '')
 
-                // Cheap pre-check: identical JSON ⇒ identical data ⇒ stored
-                // hash, baseline and (empty) diff are all still valid — skip
-                // the normalize + protocol hash + compare entirely.
-                let curJson: string | null = null
-                try { curJson = JSON.stringify(withStubs(curChar)) } catch { curJson = null }
-                if (!trackedBySave && curCharId && curJson !== null && curJson === this.lastCharJsons.get(curCharId)) {
-                    continue
+                if (!trackedBySave && characterId) {
+                    let currentJson: string | undefined
+                    try {
+                        currentJson = JSON.stringify(withStubs(curChar))
+                    } catch {
+                        currentJson = undefined
+                    }
+                    if (currentJson !== undefined && currentJson === this.lastCharJsons.get(characterId)) {
+                        if (performance.now() - scanSliceStarted >= 8) {
+                            await new Promise<void>(resolve => setTimeout(resolve, 0))
+                            scanSliceStarted = performance.now()
+                        }
+                        continue
+                    }
                 }
 
                 const normChar = normalizeJSON(withStubs(curChar))
-                const curCharHash = curCharId ? calculateHash(normChar) : undefined
-                const changedByHash = !!(curCharId && curCharHash !== this.hashBlocks[curCharId])
+                const currentHash = characterId ? calculateHash(normChar) : undefined
+                const changedByHash = !!(characterId && currentHash !== this.hashBlocks[characterId])
 
                 if (trackedBySave || changedByHash) {
-                    let charPatch = compare(lastChar, normChar).map((v) => {
-                        v.path = `/characters/${i}` + v.path;
-                        return v;
-                    })
-                    patch.push(...charPatch);
-                    this.hashBlocks[normChar.chaId] = curCharHash ?? calculateHash(normChar);
-                    this.lastSyncedDb.characters[i] = normChar;
+                    const charPatch = compare(lastChar, normChar).map((operation) => ({
+                        ...operation,
+                        path: `/characters/${i}${operation.path}`,
+                    }))
+                    patch.push(...charPatch)
+                    if (characterId) {
+                        this.hashBlocks[characterId] = currentHash ?? calculateHash(normChar)
+                        this.lastSyncedDb.characters[i] = normChar
+                        if (changedByHash) changedCharacterIds.add(characterId)
+                    }
                 }
-                // Refresh the cheap baseline from the NORMALIZED form (the
-                // server's actual state), not curJson — a raw baseline could
-                // later match a string whose normalized form differs from the
-                // server's (shared ref → null → un-share), silently skipping a
-                // real change. Normalized baseline keeps such chars on the safe
-                // full path. normChar is cycle-free, so stringify won't throw.
-                if (curCharId) {
-                    this.lastCharJsons.set(curCharId, JSON.stringify(normChar))
+                if (characterId) {
+                    this.lastCharJsons.set(characterId, JSON.stringify(normChar))
+                }
+                if (performance.now() - scanSliceStarted >= 8) {
+                    await new Promise<void>(resolve => setTimeout(resolve, 0))
+                    scanSliceStarted = performance.now()
                 }
             }
         }
@@ -1164,7 +1173,8 @@ export class RisuSavePatcher {
 
         return {
             patch,
-            expectedHash
+            expectedHash,
+            changedCharacterIds: [...changedCharacterIds],
         }
     }
 }

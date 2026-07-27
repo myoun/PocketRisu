@@ -1,4 +1,6 @@
 import { describe, test, expect, vi } from 'vitest'
+import type { Operation } from 'fast-json-patch'
+import type { Database } from './database.svelte'
 
 // Mock heavy deps so importing risuSave.ts doesn't pull the Svelte runtime
 // or trigger module-level side effects. The patcher and the helper it
@@ -12,7 +14,7 @@ vi.mock('./chatStorage', () => ({
 }))
 vi.mock('../globalApi.svelte', () => ({ forageStorage: { realStorage: null } }))
 
-const { diffArrayWithIdGuard, RisuSavePatcher } = await import('./risuSave')
+const { diffArrayWithIdGuard, RisuSaveEncoder, RisuSavePatcher } = await import('./risuSave')
 const { compare } = await import('fast-json-patch')
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -389,6 +391,133 @@ describe('RisuSavePatcher.set — botPresets path', () => {
         expect(presetOps.length).toBeGreaterThan(0)
         for (const op of presetOps) expect(op.path.startsWith('/botPresets/1')).toBe(true)
         expect(patch.find((p: any) => p.path === '/botPresets')).toBeUndefined()
+    })
+})
+
+function makeCharacter(chaId: string, description: string) {
+    return { chaId, name: chaId, desc: description, chats: [] }
+}
+
+describe('character dirty-set persistence', () => {
+    test('patcher diffs only the tracked character when structure is unchanged', async () => {
+        const initial = {
+            characters: [
+                makeCharacter('a', 'unchanged-a'),
+                makeCharacter('b', 'before'),
+                makeCharacter('c', 'unchanged-c'),
+            ],
+            botPresets: [],
+            modules: [],
+        }
+        const next = {
+            ...initial,
+            characters: [
+                initial.characters[0],
+                makeCharacter('b', 'after'),
+                initial.characters[2],
+            ],
+        }
+        const patcher = new RisuSavePatcher()
+        await patcher.init(initial)
+
+        const { patch } = await patcher.set(next, {
+            ...emptyToSave(),
+            character: ['b'],
+        })
+
+        const characterOps = patch.filter((operation: Operation) => operation.path.startsWith('/characters'))
+        expect(characterOps).toEqual([
+            { op: 'replace', path: '/characters/1/desc', value: 'after' },
+        ])
+        expect(applyOpsTo(initial, patch).characters).toEqual(next.characters)
+    })
+
+    test('patcher keeps the structural fallback for character deletion', async () => {
+        const initial = {
+            characters: [
+                makeCharacter('a', 'a'),
+                makeCharacter('b', 'b'),
+                makeCharacter('c', 'c'),
+            ],
+            botPresets: [],
+            modules: [],
+        }
+        const next = {
+            ...initial,
+            characters: [initial.characters[0], initial.characters[2]],
+        }
+        const patcher = new RisuSavePatcher()
+        await patcher.init(initial)
+
+        const { patch } = await patcher.set(next, {
+            ...emptyToSave(),
+            character: ['b'],
+        })
+
+        expect(patch.filter((operation: Operation) => operation.path.startsWith('/characters'))).toEqual([
+            { op: 'replace', path: '/characters', value: next.characters },
+        ])
+        expect(applyOpsTo(initial, patch).characters).toEqual(next.characters)
+    })
+
+    test('encoder does not serialize untouched characters on a root-only save', async () => {
+        const initial = {
+            characters: [
+                makeCharacter('a', 'a'),
+                makeCharacter('b', 'b'),
+                makeCharacter('c', 'c'),
+            ],
+            botPresets: [],
+            modules: [],
+            plugins: [],
+            pluginCustomStorage: {},
+            personaPrompt: 'before',
+        }
+        const encoder = new RisuSaveEncoder()
+        const encodeBlock = vi.spyOn(encoder, 'encodeBlock').mockResolvedValue(new Uint8Array())
+        await encoder.init(initial as unknown as Database)
+        encodeBlock.mockClear()
+
+        await encoder.set({ ...initial, personaPrompt: 'after' } as unknown as Database, {
+            ...emptyToSave(),
+            root: true,
+        })
+
+        const encodedNames = encodeBlock.mock.calls.map(([block]) => block.name)
+        expect(encodedNames).toEqual(['root'])
+    })
+
+    test('encoder serializes only the tracked character when structure is unchanged', async () => {
+        const initial = {
+            characters: [
+                makeCharacter('a', 'a'),
+                makeCharacter('b', 'before'),
+                makeCharacter('c', 'c'),
+            ],
+            botPresets: [],
+            modules: [],
+            plugins: [],
+            pluginCustomStorage: {},
+        }
+        const encoder = new RisuSaveEncoder()
+        const encodeBlock = vi.spyOn(encoder, 'encodeBlock').mockResolvedValue(new Uint8Array())
+        await encoder.init(initial as unknown as Database)
+        encodeBlock.mockClear()
+
+        await encoder.set({
+            ...initial,
+            characters: [
+                initial.characters[0],
+                makeCharacter('b', 'after'),
+                initial.characters[2],
+            ],
+        } as unknown as Database, {
+            ...emptyToSave(),
+            character: ['b'],
+        })
+
+        const encodedNames = encodeBlock.mock.calls.map(([block]) => block.name)
+        expect(encodedNames).toEqual(['b', 'root'])
     })
 })
 

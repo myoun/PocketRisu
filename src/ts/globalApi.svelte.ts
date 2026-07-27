@@ -11,7 +11,7 @@ import { alertConfirm, alertError, alertMd, alertNormalWait, alertSelect, alertT
 import { hasher } from "./parser/parser.svelte";
 import { characterURLImport, hubURL } from "./characterCards";
 import { defaultJailbreak, defaultMainPrompt, oldJailbreak, oldMainPrompt } from "./storage/defaultPrompts";
-import { decodeRisuSave, encodeRisuSaveLegacy, findDangerousChatOps, RisuSaveEncoder, RisuSavePatcher, type toSaveType } from "./storage/risuSave";
+import { decodeRisuSave, encodeRisuSaveLegacy, findDangerousChatOps, RisuSaveEncoder, RisuSavePatcher, type RisuSavePatchResult, type toSaveType } from "./storage/risuSave";
 import { isHydrating, saveChatToServer, ensureChatHydrated, chatToStub, classifyChat } from "./storage/chatStorage";
 import { AutoStorage } from "./storage/autoStorage";
 import { ConflictError, type PersistWarning } from "./storage/nodeStorage";
@@ -850,8 +850,25 @@ export async function saveDb() {
             throw new Error(`Failed to save ${failedChats.length} chat${failedChats.length === 1 ? '' : 's'}`)
         }
 
-        // ── database.bin: exclude chat payload (stubs only via encoder) ──
-        await encoder.set(db, safeStructuredClone(toSave))
+        // Build the patch first: its safety scan can discover a mutation that
+        // missed changeTracker. Feed those IDs back into both the full encoder
+        // and conflict rebase so every persistence path converges.
+        let patchData: RisuSavePatchResult | undefined
+        if (supportsPatchSync && !options?.forceFullWrite) {
+            patchData = await patcher.set(db, safeStructuredClone(toSave))
+            if (patchData.changedCharacterIds.length > 0) {
+                toSave.character = [
+                    ...new Set([...toSave.character, ...patchData.changedCharacterIds]),
+                ]
+            }
+        }
+
+        // database.bin excludes chat payload (stubs only via encoder). Legacy
+        // full-write paths retain the exhaustive safety scan; patch-sync paths
+        // reuse the patcher's discovered dirty IDs instead of scanning twice.
+        await encoder.set(db, safeStructuredClone(toSave), {
+            verifyAllCharacters: !patchData,
+        })
         const encoded = encoder.encode()
         if (!encoded) {
             await sleep(1000)
@@ -862,8 +879,7 @@ export async function saveDb() {
         let saved = false
         let newEtag: string | undefined
 
-        if (supportsPatchSync && !options?.forceFullWrite) {
-            const patchData = await patcher.set(db, safeStructuredClone(toSave))
+        if (patchData) {
             // Refuse to send patches that would corrupt server-side lazy chats.
             // chatToStub strips chats to metadata before diffing, so the only
             // way these ops appear is a baseline desync. Falling through to a
