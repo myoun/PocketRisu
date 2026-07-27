@@ -2162,6 +2162,10 @@ export const languageKorean = {
   storageRefresh: "새로고침",
   storageLoading: "불러오는 중...",
   storageFailedLoad: "스토리지 통계를 불러오지 못했습니다",
+  storageStatsLastAnalyzed: (date: string) => `마지막 분석: ${date}`,
+  storageStatsStale: "저장된 결과를 표시 중이며 백그라운드에서 갱신합니다",
+  storageStatsNeverAnalyzed:
+    "아직 저장소를 분석하지 않았습니다. 새로고침을 눌러 통계를 계산하세요.",
 
   // 디스크 사용량 (맥OS 스타일 막대)
   storageDiskUsage: "저장공간",

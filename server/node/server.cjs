@@ -25,7 +25,7 @@ const getVips = () => {
 }
 const { kvGet, kvSet, kvDel, kvList,
         kvDelPrefix, kvListWithSizes, kvSize, kvGetUpdatedAt, kvCopyValue, clearEntities, checkpointWal,
-        gcChunks, reclaimableChunkBytes, isDbBlobChunked, snapshotFootprint, db: sqliteDb } = require('./db.cjs');
+        gcChunks, snapshotFootprint, db: sqliteDb } = require('./db.cjs');
 const {
     addLogBatch, queryLogs, clearLogs, countLogs,
     logger, installProcessHandlers, expressErrorMiddleware,
@@ -39,6 +39,11 @@ const { createMcpTransport } = require('./mcpTransport.cjs');
 const { spawn, execSync } = require('child_process');
 const os = require('os');
 const { Readable, Transform } = require('stream');
+const { createStorageStatsService } = require('./storageStatsService.cjs');
+
+const storageStatsService = createStorageStatsService({
+    onPersistError: (error) => logger.warn('[StorageStats] Failed to persist cache:', error),
+});
 
 // Install process-level error handlers before any other init so early crashes get logged.
 installProcessHandlers();
@@ -4532,6 +4537,7 @@ app.post('/api/backup/server/save', async (req, res, next) => {
             writeComplete = true;
 
             const stat = await fs.stat(finalPath);
+            await storageStatsService.invalidate();
             console.log(`[Server Backup] Saved: ${filename} (${(stat.size / 1024 / 1024).toFixed(1)} MB)`);
             res.write(JSON.stringify({ type: 'done', ok: true, filename, size: stat.size }) + '\n');
             res.end();
@@ -4632,6 +4638,7 @@ app.post('/api/backup/server/restore', async (req, res, next) => {
                 res.write(JSON.stringify({ type: 'progress', bytes: received, totalBytes: total }) + '\n');
             },
         });
+        await storageStatsService.invalidate();
         res.write(JSON.stringify({
             type: 'done',
             ok: true,
@@ -4671,6 +4678,7 @@ app.delete('/api/backup/server/:filename', async (req, res, next) => {
             }
             throw err;
         }
+        await storageStatsService.invalidate();
         res.json({ ok: true });
     } catch (error) {
         next(error);
@@ -5232,7 +5240,6 @@ app.post('/api/migrate/save-folder/cleanup/execute', async (req, res, next) => {
 
 const DB_BLOB_KEY = 'database/database.bin';
 const DB_BACKUP_PREFIX = 'database/dbbackup-';
-const ASSET_PREFIXES = ['assets/', 'remotes/', 'inlay/', 'inlay_thumb/', 'inlay_meta/', 'inlay_info/', 'coldstorage/'];
 
 function statsBasename(s) {
     if (!s) return '';
@@ -5339,166 +5346,145 @@ async function sumInlayFsBytes() {
     return total;
 }
 
-// Estimated server-backup size — mirrors the enumeration in
-// /api/backup/server/save without writing anything. Inlay files live on the
-// filesystem (post-migration), so we have to fs.stat them rather than read
-// kvSize. Cost: ~5-50 ms typical, ~200 ms for users with thousands of inlays.
+// Called only when the user starts a server backup. The dashboard uses its
+// cached worker result instead of paying this synchronous KV scan on entry.
 async function estimateServerBackupSize() {
-    let total = 0;
-    total += kvSize(DB_BLOB_KEY) || 0;
-    for (const it of kvListWithSizes('assets/')) total += it.size;
-    for (const it of kvListWithSizes('inlay_meta/')) total += it.size;
-    for (const e of listColdStorageBackupEntries()) total += e.size;
+    let total = kvSize(DB_BLOB_KEY) || 0;
+    for (const item of kvListWithSizes('assets/')) total += item.size;
+    for (const item of kvListWithSizes('inlay_meta/')) total += item.size;
+    for (const entry of listColdStorageBackupEntries()) total += entry.size;
     total += await sumInlayFsBytes();
     return total;
 }
 
-app.get('/api/db/stats', async (req, res, next) => {
+async function collectFileBackupStats() {
+    const result = { count: 0, totalSize: 0, oldest: null, newest: null };
+    try {
+        const entries = await fs.readdir(backupsDir, { withFileTypes: true });
+        for (const entry of entries) {
+            if (!entry.isFile() || !BACKUP_FILENAME_REGEX.test(entry.name)) continue;
+            const stat = await fs.stat(path.join(backupsDir, entry.name));
+            result.count++;
+            result.totalSize += stat.size;
+            if (result.oldest === null || stat.mtimeMs < result.oldest) result.oldest = stat.mtimeMs;
+            if (result.newest === null || stat.mtimeMs > result.newest) result.newest = stat.mtimeMs;
+        }
+    } catch { /* backups dir may not exist */ }
+    return result;
+}
+
+async function computeFreshStorageStats() {
+    const saveDir = path.join(process.cwd(), 'save');
+    const dbFilePath = path.join(saveDir, 'risuai.db');
+    const walPath = dbFilePath + '-wal';
+    const shmPath = dbFilePath + '-shm';
+    const files = {
+        db: statSafe(dbFilePath)?.size ?? 0,
+        wal: statSafe(walPath)?.size ?? 0,
+        shm: statSafe(shmPath)?.size ?? 0,
+    };
+
+    const stripped = dbCache[DB_HEX_KEY];
+    const referencedAssets = stripped ? Array.from(buildUncleanableSet(stripped)) : [];
+    let trashed = { count: 0, expiredCount: 0, available: false };
+    if (stripped?.characters) {
+        const now = Date.now();
+        const graceMs = 1000 * 60 * 60 * 24 * 3;
+        for (const character of stripped.characters) {
+            if (!character?.trashTime) continue;
+            trashed.count++;
+            if (character.trashTime + graceMs < now) trashed.expiredCount++;
+        }
+        trashed.available = true;
+    }
+
+    const databaseStatsPromise = storageStatsService.computeDatabaseStats({ referencedAssets });
+    const diskPromise = diskFreeStat(saveDir);
+    const inlayFsBytesPromise = sumInlayFsBytes();
+    const fileBackupsPromise = collectFileBackupStats();
+    const [databaseStats, disk, inlayFsBytes, fileBackups] = await Promise.all([
+        databaseStatsPromise,
+        diskPromise,
+        inlayFsBytesPromise,
+        fileBackupsPromise,
+    ]);
+
+    let backupDisk;
+    if (backupsDir === DEFAULT_BACKUPS_DIR) {
+        backupDisk = { ...disk, path: backupsDir, sameAsSaveDir: true };
+    } else {
+        const backupDiskStats = await diskFreeStat(backupsDir);
+        let sameAsSaveDir = false;
+        try {
+            const saveStat = require('fs').statSync(saveDir);
+            const backupStat = require('fs').statSync(backupsDir);
+            sameAsSaveDir = saveStat.dev === backupStat.dev;
+        } catch { /* non-fatal */ }
+        backupDisk = { ...backupDiskStats, path: backupsDir, sameAsSaveDir };
+    }
+
+    // Cold-storage backups are exported as decoded JSON, so their estimated
+    // backup size is not the same as their compressed KV footprint.
+    const coldStorageBackupBytes = listColdStorageBackupEntries()
+        .reduce((total, entry) => total + entry.size, 0);
+    const estimatedBackupSize = databaseStats.dbBlobSize
+        + databaseStats.assetBytes
+        + databaseStats.inlayMetaBytes
+        + coldStorageBackupBytes
+        + inlayFsBytes;
+
+    return {
+        files,
+        disk,
+        backupDisk,
+        sqlite: databaseStats.sqlite,
+        chunks: databaseStats.chunks,
+        prefixes: databaseStats.prefixes,
+        kvRows: databaseStats.kvRows,
+        kvTotalBytes: databaseStats.kvTotalBytes,
+        estimatedBackupSize,
+        inlayFsBytes,
+        backups: {
+            kv: databaseStats.backups,
+            file: fileBackups,
+        },
+        trashed,
+        orphan: stripped
+            ? databaseStats.orphan
+            : { count: 0, totalSize: 0, available: false },
+        etag: dbEtag,
+    };
+}
+
+function sendCachedStorageStats(res, payload) {
+    res.setHeader('Cache-Control', 'no-store');
+    if (!payload.stats) {
+        res.json({
+            available: false,
+            cache: payload.cache,
+        });
+        return;
+    }
+    res.json({
+        ...payload.stats,
+        available: true,
+        cache: payload.cache,
+    });
+}
+
+app.get('/api/db/stats', async (req, res) => {
+    if (!await checkAuth(req, res)) return;
+    sendCachedStorageStats(res, storageStatsService.getCached());
+});
+
+app.post('/api/db/stats/refresh', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
     try {
-        const saveDir = path.join(process.cwd(), 'save');
-        const dbFilePath = path.join(saveDir, 'risuai.db');
-        const walPath = dbFilePath + '-wal';
-        const shmPath = dbFilePath + '-shm';
-
-        const files = {
-            db: statSafe(dbFilePath)?.size ?? 0,
-            wal: statSafe(walPath)?.size ?? 0,
-            shm: statSafe(shmPath)?.size ?? 0,
-        };
-
-        const disk = await diskFreeStat(saveDir);
-        // Backup destination disk — same as save/ in the default config but
-        // can diverge when the user points backupsDir at a different mount.
-        // Surfaced separately so backup-side warnings target the right disk.
-        // `sameAsSaveDir` is true when both paths land on the same filesystem
-        // (compared by Stat.dev). Dashboard uses this to decide whether to
-        // count file backups against the save/ disk in the storage chart.
-        let backupDisk;
-        if (backupsDir === DEFAULT_BACKUPS_DIR) {
-            backupDisk = { ...disk, path: backupsDir, sameAsSaveDir: true };
-        } else {
-            const bDisk = await diskFreeStat(backupsDir);
-            let sameAsSaveDir = false;
-            try {
-                const saveStat = require('fs').statSync(saveDir);
-                const bStat = require('fs').statSync(backupsDir);
-                sameAsSaveDir = saveStat.dev === bStat.dev;
-            } catch { /* non-fatal */ }
-            backupDisk = { ...bDisk, path: backupsDir, sameAsSaveDir };
-        }
-
-        const pageSize = sqliteDb.pragma('page_size', { simple: true });
-        const pageCount = sqliteDb.pragma('page_count', { simple: true });
-        const freelistCount = sqliteDb.pragma('freelist_count', { simple: true });
-        const journalMode = sqliteDb.pragma('journal_mode', { simple: true });
-        const autoVacuum = sqliteDb.pragma('auto_vacuum', { simple: true });
-        const reclaimable = freelistCount * pageSize;
-
-        const dbBlobSize = kvSize(DB_BLOB_KEY) || 0;
-
-        // Physical storage of the chunked DB blob (and all snapshots, which share
-        // chunks). This is where the blob bytes actually live post-chunking — kv
-        // holds only a tiny marker, so the chart must count this table separately.
-        const chunkStat = sqliteDb.prepare('SELECT COUNT(*) AS c, COALESCE(SUM(LENGTH(data)), 0) AS b FROM chunks').get();
-        // Bytes the next gc() would reclaim (true orphans + chunks pinned only by
-        // stale/raw-overwritten manifests) — drives the Optimize button.
-        const orphanChunkBytes = reclaimableChunkBytes();
-        const liveChunked = isDbBlobChunked();
-
-        // Prefix breakdown — split database/ into the live blob vs rotated backups.
-        const prefixes = {};
-        prefixes[DB_BLOB_KEY] = { totalSize: dbBlobSize, count: dbBlobSize > 0 ? 1 : 0 };
-        const backupKeys = kvList(DB_BACKUP_PREFIX);
-        let backupTotal = 0;
-        let backupOldest = null, backupNewest = null;
-        for (const k of backupKeys) {
-            const sz = kvSize(k) || 0;
-            backupTotal += sz;
-            const tsRaw = parseInt(k.slice(DB_BACKUP_PREFIX.length, -4), 10);
-            if (Number.isFinite(tsRaw)) {
-                const ts = tsRaw * 100;
-                if (!backupOldest || ts < backupOldest) backupOldest = ts;
-                if (!backupNewest || ts > backupNewest) backupNewest = ts;
-            }
-        }
-        prefixes[DB_BACKUP_PREFIX] = { totalSize: backupTotal, count: backupKeys.length };
-        for (const p of ASSET_PREFIXES) {
-            const items = kvListWithSizes(p);
-            let total = 0;
-            for (const it of items) total += it.size;
-            prefixes[p] = { totalSize: total, count: items.length };
-        }
-
-        const kvRows = sqliteDb.prepare('SELECT COUNT(*) AS c FROM kv').get().c;
-        const kvTotalBytes = sqliteDb.prepare('SELECT COALESCE(SUM(LENGTH(value)), 0) AS s FROM kv').get().s;
-
-        let fileBackups = { count: 0, totalSize: 0, oldest: null, newest: null };
-        try {
-            const entries = await fs.readdir(backupsDir, { withFileTypes: true });
-            for (const e of entries) {
-                if (!e.isFile() || !BACKUP_FILENAME_REGEX.test(e.name)) continue;
-                const st = await fs.stat(path.join(backupsDir, e.name));
-                fileBackups.count++;
-                fileBackups.totalSize += st.size;
-                const ts = st.mtimeMs;
-                if (!fileBackups.oldest || ts < fileBackups.oldest) fileBackups.oldest = ts;
-                if (!fileBackups.newest || ts > fileBackups.newest) fileBackups.newest = ts;
-            }
-        } catch { /* backups dir may not exist */ }
-
-        // Quick estimates from in-memory cache only — never decode the BLOB just for stats.
-        let trashed = { count: 0, expiredCount: 0, available: false };
-        let orphan = { count: 0, totalSize: 0, available: false };
-        const stripped = dbCache[DB_HEX_KEY];
-        if (stripped?.characters) {
-            const now = Date.now();
-            const GRACE = 1000 * 60 * 60 * 24 * 3;
-            for (const c of stripped.characters) {
-                if (c?.trashTime) {
-                    trashed.count++;
-                    if (c.trashTime + GRACE < now) trashed.expiredCount++;
-                }
-            }
-            trashed.available = true;
-        }
-        if (stripped) {
-            const uncleanable = buildUncleanableSet(stripped);
-            for (const it of kvListWithSizes('assets/')) {
-                if (!uncleanable.has(statsBasename(it.key))) {
-                    orphan.count++;
-                    orphan.totalSize += it.size;
-                }
-            }
-            orphan.available = true;
-        }
-
-        const estimatedBackupSize = await estimateServerBackupSize();
-        // Inlay payload now lives on the filesystem (post-migration) rather
-        // than in kv `inlay/*` prefixes. Surface explicitly so the dashboard
-        // chart can include it in the inlay slice instead of underreporting.
-        const inlayFsBytes = await sumInlayFsBytes();
-
-        res.json({
-            files,
-            disk,
-            backupDisk,
-            sqlite: { pageSize, pageCount, freelistCount, reclaimable, journalMode, autoVacuum },
-            chunks: { count: chunkStat.c, bytes: chunkStat.b, orphanBytes: orphanChunkBytes, liveChunked },
-            prefixes,
-            kvRows,
-            kvTotalBytes,
-            estimatedBackupSize,
-            inlayFsBytes,
-            backups: {
-                kv: { count: backupKeys.length, totalSize: backupTotal, oldest: backupOldest, newest: backupNewest },
-                file: fileBackups,
-            },
-            trashed,
-            orphan,
-            etag: dbEtag,
-        });
-    } catch (err) { next(err); }
+        await storageStatsService.refresh(computeFreshStorageStats);
+        sendCachedStorageStats(res, storageStatsService.getCached());
+    } catch (error) {
+        next(error);
+    }
 });
 
 app.get('/api/db/stats/characters', async (req, res, next) => {
@@ -5693,6 +5679,7 @@ app.post('/api/db/optimize', async (req, res, next) => {
                 chunksReclaimed: gcDeleted,
             };
         });
+        await storageStatsService.invalidate();
         res.json(result);
     } catch (err) { next(err); }
 });
@@ -5719,6 +5706,7 @@ app.post('/api/db/wal-checkpoint', async (req, res, next) => {
                 reclaimed: Math.max(0, preWalSize - postWalSize),
             };
         });
+        await storageStatsService.invalidate();
         res.json(result);
     } catch (err) { next(err); }
 });
@@ -5768,6 +5756,7 @@ app.put('/api/db/snapshots/limits', async (req, res, next) => {
         kvSet(SNAPSHOT_LIMIT_BYTES_KEY, Buffer.from(String(maxBytes), 'utf-8'));
         const trim = trimSnapshotsToLimits();
         const usage = snapshotUsage();
+        await storageStatsService.invalidate();
         res.json({
             maxCount, maxBytes,
             currentCount: usage.count,
@@ -5806,6 +5795,7 @@ app.delete('/api/db/snapshots', async (req, res, next) => {
             return res.status(400).json({ error: 'Invalid snapshot key' });
         }
         kvDel(key);
+        await storageStatsService.invalidate();
         res.json({ ok: true });
     } catch (err) { next(err); }
 });
@@ -5858,6 +5848,7 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
                 logger.warn('[Snapshot restore] post-restore decode failed:', e?.message || e);
             }
         });
+        await storageStatsService.invalidate();
         res.json({ ok: true });
     } catch (err) { next(err); }
 });
@@ -5934,6 +5925,7 @@ app.put('/api/backup/server/path', async (req, res, next) => {
         backupsDir = resolved;
         kvSet(BACKUP_PATH_CONFIG_KEY, Buffer.from(resolved, 'utf-8'));
         writeBackupPathMarker(resolved);
+        await storageStatsService.invalidate();
         res.json({
             path: backupsDir,
             previous,
@@ -6590,6 +6582,7 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
         console.log(`[Server] Received ${sig}, flushing pending data...`);
         stopTunnel();
         try { await flushPendingDb(); } catch (e) { logger.error('[Server] Flush error:', e); }
+        try { await storageStatsService.close(); } catch { /* non-fatal */ }
         try { checkpointWal('TRUNCATE'); } catch { /* non-fatal */ }
         process.exit(0);
     });

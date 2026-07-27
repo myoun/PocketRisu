@@ -25,6 +25,7 @@
     import { changeChar } from 'src/ts/characters'
     import { SystemTab } from 'src/ts/routing'
     import { language, getCurrentLocale } from 'src/lang'
+    import { onMount } from 'svelte'
 
     // ── Types ────────────────────────────────────────────────────────────────
     interface PrefixInfo { totalSize: number; count: number }
@@ -49,6 +50,16 @@
         orphan: { count: number; totalSize: number; available: boolean }
         etag: string | null
     }
+    interface StatsCache {
+        available: boolean
+        computedAt: number | null
+        stale: boolean
+        expired: boolean
+        refreshing: boolean
+    }
+    type StatsResponse =
+        | (Stats & { available: true; cache: StatsCache })
+        | { available: false; cache: StatsCache }
     interface CharBreakdown {
         chaId: string; name: string; image: string; trashed: boolean
         cardBytes: number; imgBytes: number; chatBytes: number; totalBytes: number
@@ -67,6 +78,7 @@
 
     // ── State ────────────────────────────────────────────────────────────────
     let stats = $state<Stats | null>(null)
+    let statsCache = $state<StatsCache | null>(null)
     let loading = $state(false)
     let loadError = $state<string | null>(null)
 
@@ -116,14 +128,37 @@
     }
 
     // ── Fetch ────────────────────────────────────────────────────────────────
-    async function loadStats() {
+    async function loadCachedStats() {
         loading = true
         loadError = null
         try {
             const auth = await forageStorage.createAuth()
             const res = await fetch('/api/db/stats', { headers: { 'risu-auth': auth } })
             if (!res.ok) throw new Error(`HTTP ${res.status}`)
-            stats = await res.json()
+            const payload: StatsResponse = await res.json()
+            statsCache = payload.cache
+            stats = payload.available ? payload : null
+        } catch (err) {
+            loadError = err instanceof Error ? err.message : String(err)
+        } finally {
+            loading = false
+        }
+    }
+
+    async function refreshStats() {
+        if (loading) return
+        loading = true
+        loadError = null
+        try {
+            const auth = await forageStorage.createAuth()
+            const res = await fetch('/api/db/stats/refresh', {
+                method: 'POST',
+                headers: { 'risu-auth': auth },
+            })
+            if (!res.ok) throw new Error(`HTTP ${res.status}`)
+            const payload: StatsResponse = await res.json()
+            statsCache = payload.cache
+            stats = payload.available ? payload : null
         } catch (err) {
             loadError = err instanceof Error ? err.message : String(err)
         } finally {
@@ -188,7 +223,7 @@
             } else {
                 notifySuccess(language.storageWalCleanupNoop)
             }
-            await loadStats()
+            await refreshStats()
         } catch (err) {
             notifyError(language.storageWalCleanupFailed + ': ' + (err instanceof Error ? err.message : String(err)))
         } finally {
@@ -217,7 +252,7 @@
                 return
             }
             notifySuccess(language.storageOptimizeDone(json.reclaimed ?? 0, json.elapsedMs ?? 0))
-            await loadStats()
+            await refreshStats()
         } catch (err) {
             notifyError(language.storageOptimizeFailed + ': ' + (err instanceof Error ? err.message : String(err)))
         } finally {
@@ -361,13 +396,33 @@
         alertMd(`### ${label}\n\n${fmtBytes(size)}\n\n${desc}`)
     }
 
-    $effect(() => { loadStats() })
+    onMount(() => {
+        let disposed = false
+        let refreshTimer: ReturnType<typeof setTimeout> | undefined
+        void loadCachedStats().then(() => {
+            if (!disposed && stats && statsCache?.stale) {
+                refreshTimer = setTimeout(() => void refreshStats(), 500)
+            }
+        })
+        return () => {
+            disposed = true
+            if (refreshTimer) clearTimeout(refreshTimer)
+        }
+    })
 </script>
 
 <p class="text-textcolor2 text-sm mb-4">{language.storageDashboardDesc}</p>
 
-<div class="flex justify-end mb-3">
-    <ShButton variant="outline" size="default" onclick={loadStats} disabled={loading}>
+<div class="flex items-center justify-between gap-3 mb-3">
+    <div class="min-w-0 text-xs text-textcolor2">
+        {#if statsCache?.computedAt}
+            <span>{language.storageStatsLastAnalyzed(fmtDate(statsCache.computedAt))}</span>
+            {#if statsCache.stale}
+                <span> · {language.storageStatsStale}</span>
+            {/if}
+        {/if}
+    </div>
+    <ShButton variant="outline" size="default" onclick={refreshStats} disabled={loading}>
         <RefreshCwIcon size={16} class={loading ? 'animate-spin' : ''} />
         <span class="hidden sm:inline">{loading ? language.storageLoading : language.storageRefresh}</span>
     </ShButton>
@@ -377,6 +432,13 @@
     <ShAlert variant="destructive" className="mb-4">
         {#snippet icon()}<TriangleAlertIcon />{/snippet}
         {language.storageFailedLoad}: {loadError}
+    </ShAlert>
+{/if}
+
+{#if !stats && !loading && !loadError}
+    <ShAlert className="mb-4">
+        {#snippet icon()}<InfoIcon />{/snippet}
+        {language.storageStatsNeverAnalyzed}
     </ShAlert>
 {/if}
 

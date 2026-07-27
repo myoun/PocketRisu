@@ -1994,6 +1994,9 @@ export const languageEnglish = {
     storageRefresh: "Refresh",
     storageLoading: "Loading...",
     storageFailedLoad: "Failed to load storage stats",
+    storageStatsLastAnalyzed: (date: string) => `Last analyzed: ${date}`,
+    storageStatsStale: "Showing saved results; refreshing in the background",
+    storageStatsNeverAnalyzed: "Storage has not been analyzed yet. Select Refresh to calculate statistics.",
 
     // Disk usage section (macOS-style bar)
     storageDiskUsage: "Storage",
