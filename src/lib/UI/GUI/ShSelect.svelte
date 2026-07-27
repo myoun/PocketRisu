@@ -16,6 +16,7 @@
     //   above/below positioning.
     import { ChevronDownIcon, CheckIcon } from "@lucide/svelte";
     import { isTouchDevice } from "src/ts/stores.svelte";
+    import Portal from "./Portal.svelte";
 
     interface Props {
         value: string | number;
@@ -241,33 +242,35 @@
     </div>
 
     {#if open}
-        <div
-            id={listboxId}
-            bind:this={dropdownEl}
-            role="listbox"
-            class="fixed z-50 max-h-64 overflow-y-auto rounded-md bg-darkbg shadow-md
-                   ring-1 ring-textcolor/10 p-1"
-            style={dropdownStyle}
-        >
-            {#each extractedOptions as opt, i}
-                <button
-                    id={getOptionId(i)}
-                    role="option"
-                    aria-selected={opt.value === String(value)}
-                    class="relative flex w-full items-center gap-2 rounded-md {itemSizeClasses[size]}
-                           text-textcolor cursor-pointer select-none text-left whitespace-nowrap
-                           {i === highlightedIndex ? 'bg-selected' : 'hover:bg-selected/50'}"
-                    onmouseenter={() => highlightedIndex = i}
-                    onclick={() => selectOption(opt.value)}
-                >
-                    {opt.label}
-                    {#if opt.value === String(value)}
-                        <span class="pointer-events-none absolute right-2 flex size-4 items-center justify-center">
-                            <CheckIcon class="size-4 text-borderc" />
-                        </span>
-                    {/if}
-                </button>
-            {/each}
-        </div>
+        <Portal>
+            <div
+                id={listboxId}
+                bind:this={dropdownEl}
+                role="listbox"
+                class="fixed z-50 max-h-64 overflow-y-auto rounded-md bg-darkbg shadow-md
+                       ring-1 ring-textcolor/10 p-1"
+                style={dropdownStyle}
+            >
+                {#each extractedOptions as opt, i}
+                    <button
+                        id={getOptionId(i)}
+                        role="option"
+                        aria-selected={opt.value === String(value)}
+                        class="relative flex w-full items-center gap-2 rounded-md {itemSizeClasses[size]}
+                               text-textcolor cursor-pointer select-none text-left whitespace-nowrap
+                               {i === highlightedIndex ? 'bg-selected' : 'hover:bg-selected/50'}"
+                        onmouseenter={() => highlightedIndex = i}
+                        onclick={() => selectOption(opt.value)}
+                    >
+                        {opt.label}
+                        {#if opt.value === String(value)}
+                            <span class="pointer-events-none absolute right-2 flex size-4 items-center justify-center">
+                                <CheckIcon class="size-4 text-borderc" />
+                            </span>
+                        {/if}
+                    </button>
+                {/each}
+            </div>
+        </Portal>
     {/if}
 {/if}
