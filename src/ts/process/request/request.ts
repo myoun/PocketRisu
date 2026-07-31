@@ -39,6 +39,7 @@ import { pumpPresetStream } from "./presetStreamPump";
 import { makeJobFetch } from "./jobFetch";
 import { resolveChatModelBinding, buildModelPresetCredential, applyPromptPresetParams } from "./modelPresetBinding";
 import { expandAdapterMessages, toAdapterMessage, toolResponseText } from "./modelPresetMessages";
+import { trackPluginProviderStream } from "./pluginStreamTracker";
 import { isLocalNetworkUrl } from "src/ts/network/localNetwork";
 import { createRequestLogScope, type RequestLogRoute, type RequestLogSource, type RequestLogUsage } from "src/ts/requestLog";
 import {
@@ -1607,11 +1608,17 @@ async function requestPlugin(arg:RequestDataArgumentExtended):Promise<requestDat
     const db = getDatabase()
     const isV3Model = arg.aiModel.startsWith('pluginmodel:::')
     const responseModel = isV3Model ? arg.aiModel : 'custom'
+    const model = isV3Model ? arg.aiModel.replace('pluginmodel:::', '') : db.currentPluginProvider
+    const statusId = arg.chatId ?? `aux-${uuidv4()}`
+    const reportStatus = statusEnabled() && !!statusId
+    const finishStatus = (outcome: 'done' | 'failed' | 'aborted', error?: string) => {
+        if (!reportStatus) return
+        safeStatus(() => endStatus(statusId, outcome, { now: Date.now(), error }))
+    }
     try {
         const formated = arg.formated
         const maxTokens = arg.maxTokens
         const bias = arg.biasString
-        const model = isV3Model ? arg.aiModel.replace('pluginmodel:::', '') : db.currentPluginProvider
         const v2Function = pluginV2.providers.get(model)
 
         if(arg.previewBody){
@@ -1621,6 +1628,16 @@ async function requestPlugin(arg:RequestDataArgumentExtended):Promise<requestDat
                     error: "Plugin is not supported in preview mode"
                 })
             }
+        }
+
+        if (reportStatus) {
+            safeStatus(() => startStatus(statusId, {
+                kind: toRequestKind(arg.mode ?? 'model'),
+                label: model,
+                chatId: arg.chatId,
+                phase: 'connecting',
+                now: Date.now(),
+            }))
         }
     
         const d = v2Function ? (await v2Function(applyParameters({
@@ -1642,6 +1659,7 @@ async function requestPlugin(arg:RequestDataArgumentExtended):Promise<requestDat
         })
     
         if(!d){
+            finishStatus('failed', language.errors.unknownModel)
             return {
                 type: 'fail',
                 result: (language.errors.unknownModel),
@@ -1649,39 +1667,49 @@ async function requestPlugin(arg:RequestDataArgumentExtended):Promise<requestDat
             }
         }
         else if(!d.success){
+            const failureContent = d.content instanceof ReadableStream ? await (new Response(d.content)).text() : d.content
+            finishStatus(arg.abortSignal?.aborted ? 'aborted' : 'failed', String(failureContent ?? ''))
             return {
                 type: 'fail',
-                result: d.content instanceof ReadableStream ? await (new Response(d.content)).text() : d.content,
+                result: failureContent,
                 model: responseModel
             }
         }
         else if(d.content instanceof ReadableStream){
-    
-            let fullText = ''
-            const piper = new TransformStream<string, StreamResponseChunk>(  {
-                transform(chunk, control) {
-                    fullText += chunk
-                    control.enqueue({
-                        "0": fullText
-                    })
-                }
+            const trackedStream = trackPluginProviderStream(d.content, {
+                signal: arg.abortSignal,
+                onChunk: reportStatus ? (chunk) => {
+                    if (chunk) safeStatus(() => appendText(statusId, { response: chunk }, Date.now()))
+                } : undefined,
+                onFinish: (outcome, error) => {
+                    finishStatus(outcome, outcome === 'failed'
+                        ? (error instanceof Error ? error.message : String(error))
+                        : undefined)
+                },
             })
     
             return {
                 type: 'streaming',
-                result: d.content.pipeThrough(piper),
+                result: trackedStream,
                 model: responseModel
             }
         }
         else{
+            const content = d.content ?? ''
+            if (reportStatus && content) {
+                safeStatus(() => appendText(statusId, { response: content }, Date.now()))
+            }
+            finishStatus('done')
             return {
                 type: 'success',
-                result: d.content ?? '',
+                result: content,
                 model: responseModel
             }
         }   
     } catch (error) {
         console.error(error)
+        const aborted = arg.abortSignal?.aborted === true
+        finishStatus(aborted ? 'aborted' : 'failed', aborted ? undefined : (error instanceof Error ? error.message : String(error)))
         return {
             type: 'fail',
             result: `Plugin Error from ${db.currentPluginProvider}: ` + JSON.stringify(error),
